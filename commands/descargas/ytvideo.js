@@ -5,20 +5,17 @@ import axios from "axios";
 import yts from "yt-search";
 import { pipeline } from "stream/promises";
 
-const API_URL = "https://gawrgura-api.onrender.com/download/ytdl";
+const API_URL = "https://TU_API_AQUI/ytmp4"; // <-- pon aquí tu endpoint real
 
-// ✅ TMP propio dentro del proyecto (más control y limpieza)
 const TMP_DIR = path.join(process.cwd(), "tmp");
 
-// ⛔ Ajusta límites según tu host/WhatsApp
-const MAX_BYTES = 90 * 1024 * 1024; // 90MB
-const MAX_SECONDS = 20 * 60; // 20 min (evita cosas gigantes)
+const MAX_BYTES = 90 * 1024 * 1024;
+const MAX_SECONDS = 20 * 60;
 const COOLDOWN_TIME = 15000;
 
 const cooldowns = new Map();
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// ✅ cola global (evita muchas descargas simultáneas)
 let busy = false;
 async function withGlobalLock(fn) {
   while (busy) await sleep(400);
@@ -32,7 +29,6 @@ async function withGlobalLock(fn) {
 
 function ensureTmp() {
   if (!fs.existsSync(TMP_DIR)) fs.mkdirSync(TMP_DIR, { recursive: true });
-  // ayuda a que libs usen este tmp
   process.env.TMPDIR = TMP_DIR;
   process.env.TMP = TMP_DIR;
   process.env.TEMP = TMP_DIR;
@@ -58,7 +54,6 @@ async function cleanTmp(dir, maxAgeMs = 60 * 60 * 1000) {
   }
 }
 
-// limpia cada 10 min lo viejo
 setInterval(() => cleanTmp(TMP_DIR).catch(() => {}), 10 * 60 * 1000);
 
 function isENOSPC(err) {
@@ -69,45 +64,7 @@ function isENOSPC(err) {
   );
 }
 
-async function axiosGetWithRetry(url, opts, retries = 2) {
-  let lastErr;
-  for (let i = 0; i <= retries; i++) {
-    try {
-      return await axios.get(url, opts);
-    } catch (e) {
-      lastErr = e;
-      const code = e?.response?.status;
-      const retryable =
-        !code ||
-        code >= 500 ||
-        code === 429 ||
-        e?.code === "ECONNRESET" ||
-        e?.code === "ETIMEDOUT" ||
-        e?.code === "ECONNABORTED";
-
-      if (!retryable || i === retries) throw lastErr;
-      await sleep(500 * (i + 1));
-    }
-  }
-  throw lastErr;
-}
-
-async function axiosHeadSafe(url) {
-  try {
-    const res = await axios.head(url, {
-      timeout: 15000,
-      maxRedirects: 5,
-      headers: { "User-Agent": "Mozilla/5.0" },
-    });
-    const len = Number(res?.headers?.["content-length"] || 0);
-    return len || 0;
-  } catch {
-    return 0; // si no hay HEAD o falla, no bloqueamos
-  }
-}
-
 async function downloadToFile(mp4Url, filePath) {
-  // descarga robusta con pipeline
   const res = await axios.get(mp4Url, {
     responseType: "stream",
     timeout: 120000,
@@ -118,7 +75,7 @@ async function downloadToFile(mp4Url, filePath) {
   await pipeline(res.data, fs.createWriteStream(filePath));
 
   const size = fs.statSync(filePath).size;
-  if (size < 700000) throw new Error("Archivo incompleto (muy pequeño)");
+  if (size < 700000) throw new Error("Archivo incompleto");
   if (MAX_BYTES && size > MAX_BYTES) throw new Error("Archivo supera el límite permitido");
   return size;
 }
@@ -134,10 +91,8 @@ export default {
 
     const userId = from;
     const now = Date.now();
-
     let rawMp4 = null;
 
-    // 🔒 COOLDOWN
     const cooldown = cooldowns.get(userId);
     if (cooldown && cooldown > now) {
       return sock.sendMessage(from, {
@@ -161,78 +116,38 @@ export default {
         await sock.sendMessage(from, { react: { text: "⏳", key: messageKey } });
       }
 
-      ensureTmp();
-      await cleanTmp(TMP_DIR).catch(() => {});
-
       let query = args.join(" ").trim();
       let videoUrl = query;
 
-      // 🔍 Si no es link, buscar en YouTube (filtra largos)
       if (!/^https?:\/\//i.test(query)) {
         const search = await yts(query);
         if (!search?.videos?.length) throw new Error("Sin resultados");
-
-        const pick =
-          search.videos.find((v) => v?.seconds && v.seconds <= MAX_SECONDS && !v.live) ||
-          search.videos[0];
-
-        videoUrl = pick.url;
+        videoUrl = search.videos[0].url;
       }
 
-      // 🌐 Pedir MP4 a tu API
-      const { data } = await axiosGetWithRetry(
+      // 🔥 LLAMADA A TU NUEVA API
+      const { data } = await axios.get(
         `${API_URL}?url=${encodeURIComponent(videoUrl)}`,
-        { timeout: 25000 },
-        2
+        { timeout: 25000 }
       );
 
-      if (!data?.status || !data?.result?.mp4) {
-        throw new Error("API inválida o sin mp4");
+      if (!data?.status || !data?.result?.url) {
+        throw new Error("API inválida o sin URL");
       }
 
-      const mp4Url = data.result.mp4;
-      if (typeof mp4Url !== "string" || !mp4Url.startsWith("http")) {
-        throw new Error("mp4Url inválido");
-      }
+      const mp4Url = data.result.url;
 
-      // ✅ chequeo de tamaño antes (si el server lo da)
-      const len = await axiosHeadSafe(mp4Url);
-      if (len && len > MAX_BYTES) {
-        throw new Error(
-          `El video pesa ~${Math.ceil(len / (1024 * 1024))}MB y supera el límite (${Math.ceil(
-            MAX_BYTES / (1024 * 1024)
-          )}MB).`
-        );
-      }
-
-      // ⬇️ Descargar y 📤 enviar con cola global (evita llenar disco)
       await withGlobalLock(async () => {
         rawMp4 = path.join(TMP_DIR, `${Date.now()}_video.mp4`);
 
-        let ok = false;
-        let lastErr = null;
+        await downloadToFile(mp4Url, rawMp4);
 
-        for (let i = 0; i < 3; i++) {
-          try {
-            await downloadToFile(mp4Url, rawMp4);
-            ok = true;
-            break;
-          } catch (e) {
-            lastErr = e;
-            // si es ENOSPC, no tiene sentido reintentar sin limpiar
-            if (isENOSPC(e)) break;
-            await sleep(1500 * (i + 1));
-          }
-        }
-
-        if (!ok) throw lastErr || new Error("Fallo descarga");
-
-        // ✅ ENVÍO desde ruta (sin readFileSync => menos RAM)
         await sock.sendMessage(
           from,
           {
             video: { url: rawMp4 },
             mimetype: "video/mp4",
+            caption: `🎬 Calidad: ${data.result.quality || "360p"}`,
           },
           msg?.key ? { quoted: msg } : undefined
         );
@@ -241,31 +156,23 @@ export default {
       if (messageKey) {
         await sock.sendMessage(from, { react: { text: "✅", key: messageKey } });
       }
+
     } catch (err) {
       console.error("YTMP4 ERROR:", err?.message || err);
       cooldowns.delete(userId);
 
-      if (messageKey) {
-        try {
-          await sock.sendMessage(from, { react: { text: "❌", key: messageKey } });
-        } catch {}
-      }
-
       if (isENOSPC(err)) {
-        // limpia tmp al instante para recuperar
-        try {
-          await cleanTmp(TMP_DIR, 0);
-        } catch {}
+        try { await cleanTmp(TMP_DIR, 0); } catch {}
         return sock.sendMessage(from, {
-          text: "❌ *Sin espacio en el servidor (ENOSPC).* Ya limpié temporales.\n\n✅ Solución: libera espacio en el host o aumenta el almacenamiento.",
+          text: "❌ Sin espacio en el servidor. Limpia el almacenamiento.",
         });
       }
 
       await sock.sendMessage(from, {
-        text: `❌ Error al descargar/enviar el video.\n${err?.message ? `\n🧾 ${err.message}` : ""}`,
+        text: `❌ Error:\n${err?.message || "No se pudo descargar el video."}`,
       });
+
     } finally {
-      // 🧹 Limpieza del archivo descargado
       try {
         if (rawMp4 && fs.existsSync(rawMp4)) fs.unlinkSync(rawMp4);
       } catch {}
@@ -273,7 +180,5 @@ export default {
   },
 };
 
-// ✅ evita que el proceso se muera si algo se escapa
 process.on("uncaughtException", (e) => console.error("Uncaught:", e));
 process.on("unhandledRejection", (e) => console.error("Unhandled:", e));
-
