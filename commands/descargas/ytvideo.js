@@ -3,6 +3,7 @@ import yts from "yt-search";
 
 const API_URL = "https://nexevo-api.vercel.app/download/y2";
 const COOLDOWN_TIME = 15000;
+const MAX_BYTES = 80 * 1024 * 1024; // 80MB seguro para WhatsApp
 
 const cooldowns = new Map();
 
@@ -45,14 +46,13 @@ export default {
       let query = args.join(" ");
       let videoUrl = query;
 
-      // 🔎 buscar si no es link
       if (!/^https?:\/\//i.test(query)) {
         const search = await yts(query);
         if (!search.videos.length) throw new Error("Sin resultados");
         videoUrl = search.videos[0].url;
       }
 
-      // 🔥 LLAMADA A TU API
+      // 🔥 Llamada API
       const { data } = await axios.get(
         `${API_URL}?url=${encodeURIComponent(videoUrl)}`,
         { timeout: 25000 }
@@ -64,11 +64,24 @@ export default {
 
       const mp4Url = data.result.url;
 
-      // 🚀 ENVIAR DIRECTO DESDE URL (SIN TMP)
+      // 🚀 Descargar como BUFFER
+      const videoRes = await axios.get(mp4Url, {
+        responseType: "arraybuffer",
+        timeout: 120000,
+        headers: { "User-Agent": "Mozilla/5.0" },
+      });
+
+      const buffer = Buffer.from(videoRes.data);
+
+      if (buffer.length > MAX_BYTES) {
+        throw new Error("El video supera el límite permitido (80MB).");
+      }
+
+      // 📤 Enviar buffer
       await sock.sendMessage(
         from,
         {
-          video: { url: mp4Url },
+          video: buffer,
           mimetype: "video/mp4",
           caption: `🎬 Calidad: ${data.result.quality || "360p"}`,
         },
