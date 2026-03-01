@@ -35,7 +35,7 @@ async function remuxStreamToMp4({ inputUrl, outPath }) {
 
   // (Opcional) límite por tamaño si viene Content-Length
   const len = Number(res.headers["content-length"] || 0);
-  const MAX_BYTES = 90 * 1024 * 1024; // 90MB aprox
+  const MAX_BYTES = 150 * 1024 * 1024; // 90MB aprox
   if (len && len > MAX_BYTES) {
     // cerrar stream
     try { res.data.destroy(); } catch {}
