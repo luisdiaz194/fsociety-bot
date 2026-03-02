@@ -5,9 +5,9 @@
   "ownerNumbers": ["51907376960"],
   "ownerLids": ["88077330554979"],
   "botNumber": "524531461401",
-
   "newsletter": {
     "enabled": true,
+    "applyToAllMessages": false,
     "jid": "120363423619533679@newsletter",
     "name": "⺪Artoria Bot - SonGoku Bot 乂​"
   }
