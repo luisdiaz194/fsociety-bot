@@ -1,196 +1,183 @@
+import fs from "fs";
+import path from "path";
 import axios from "axios";
 import yts from "yt-search";
-import fs from "fs";
-import fsp from "fs/promises";
-import path from "path";
+import { exec } from "child_process";
 
-const API_URL = "https://nexevo-api.vercel.app/download/y";
-const COOLDOWN = 8000;
-const cooldowns = new Map();
-const MAX_BYTES = 25 * 1024 * 1024;
+const API_URL = "https://mayapi.ooguy.com/ytdl";
+const API_KEY = "may-5d597e52";
 
-let busy = false;
-
-function wait(ms) {
-  return new Promise((r) => setTimeout(r, ms));
-}
-
-async function withGlobalLock(fn) {
-  while (busy) await wait(400);
-  busy = true;
-  try {
-    return await fn();
-  } finally {
-    busy = false;
-  }
-}
-
+const COOLDOWN_TIME = 10 * 1000;
 const TMP_DIR = path.join(process.cwd(), "tmp");
 
-async function cleanTmp(dir, maxAgeMs = 60 * 60 * 1000) {
-  const now = Date.now();
-  let files = [];
-  try {
-    files = await fsp.readdir(dir);
-  } catch {
-    return;
-  }
+const MAX_AUDIO_BYTES = 100 * 1024 * 1024; // 100MB max audio
 
-  for (const name of files) {
-    const p = path.join(dir, name);
-    try {
-      const st = await fsp.stat(p);
-      if (st.isFile() && now - st.mtimeMs > maxAgeMs) {
-        await fsp.unlink(p);
-      }
-    } catch {}
-  }
-}
+const DEFAULT_QUALITY = "128kbps";
+const cooldowns = new Map();
 
-setInterval(() => cleanTmp(TMP_DIR).catch(() => {}), 10 * 60 * 1000);
+if (!fs.existsSync(TMP_DIR)) fs.mkdirSync(TMP_DIR, { recursive: true });
 
 function safeFileName(name) {
   return String(name || "audio")
     .replace(/[\\/:*?"<>|]/g, "")
     .replace(/\s+/g, " ")
     .trim()
-    .slice(0, 60);
+    .slice(0, 80);
+}
+
+function isHttpUrl(s) {
+  return /^https?:\/\//i.test(String(s || ""));
+}
+
+// API
+async function fetchDirectMediaUrl({ videoUrl }) {
+  const { data } = await axios.get(API_URL, {
+    timeout: 20000,
+    params: {
+      url: videoUrl,
+      quality: "360p", // solo para obtener link válido
+      apikey: API_KEY,
+    },
+  });
+
+  if (!data?.status || !data?.result?.url) {
+    throw new Error("API inválida");
+  }
+
+  return {
+    title: data?.result?.title || "audio",
+    directUrl: data.result.url,
+  };
+}
+
+// Convertir directo a MP3
+async function convertToMp3(inputUrl, outputPath) {
+  return new Promise((resolve, reject) => {
+    exec(
+      `ffmpeg -y -i "${inputUrl}" -vn -ab 128k -ar 44100 -loglevel error "${outputPath}"`,
+      (err) => (err ? reject(err) : resolve())
+    );
+  });
 }
 
 export default {
-  command: ["ytmp3", "play"],
+  command: ["ytmp3"],
   category: "descarga",
 
   run: async (ctx) => {
     const { sock, from, args } = ctx;
     const msg = ctx.m || ctx.msg || null;
-    const messageKey = msg?.key || null;
 
-    const now = Date.now();
-    const userCooldown = cooldowns.get(from);
+    const userId = from;
+    let finalMp3;
 
-    if (userCooldown && now < userCooldown) {
-      return sock.sendMessage(
-        from,
-        { text: `⏳ Espera ${Math.ceil((userCooldown - now) / 1000)}s`, ...global.channelInfo },
-        msg ? { quoted: msg } : undefined
-      );
+    const until = cooldowns.get(userId);
+    if (until && until > Date.now()) {
+      return sock.sendMessage(from, {
+        text: `⏳ Espera ${Math.ceil((until - Date.now()) / 1000)}s`,
+        ...global.channelInfo,
+      });
     }
+    cooldowns.set(userId, Date.now() + COOLDOWN_TIME);
 
-    cooldowns.set(from, now + COOLDOWN);
+    const quoted = msg?.key ? { quoted: msg } : undefined;
 
     try {
       if (!args?.length) {
-        cooldowns.delete(from);
-        return sock.sendMessage(
-          from,
-          { text: "🎧 Uso: .ytmp3 <nombre o link>", ...global.channelInfo },
-          msg ? { quoted: msg } : undefined
-        );
+        cooldowns.delete(userId);
+        return sock.sendMessage(from, {
+          text: "❌ Uso: .ytmp3 <nombre o link>",
+          ...global.channelInfo,
+        });
       }
 
-      if (messageKey) {
-        await sock.sendMessage(from, { react: { text: "⏳", key: messageKey } });
-      }
+      const query = args.join(" ").trim();
 
-      await cleanTmp(TMP_DIR).catch(() => {});
-
-      let query = args.join(" ").trim();
       let videoUrl = query;
-      let title = "YouTube Audio";
-      let thumbnail = "";
-      let duration = "??";
+      let title = "audio";
+      let thumbnail = null;
 
-      if (!/^https?:\/\//i.test(query)) {
-        const { videos } = await yts(query);
-        if (!videos?.length) throw new Error("Sin resultados");
+      finalMp3 = path.join(TMP_DIR, `${Date.now()}.mp3`);
 
-        const v = videos.find((x) => x.seconds && x.seconds < 1800) || videos[0];
+      // Buscar si no es link
+      if (!isHttpUrl(query)) {
+        const search = await yts(query);
+        const first = search?.videos?.[0];
 
-        videoUrl = v.url;
-        title = v.title;
-        thumbnail = v.thumbnail;
-        duration = v.timestamp;
+        if (!first) {
+          cooldowns.delete(userId);
+          return sock.sendMessage(from, {
+            text: "❌ No se encontró.",
+            ...global.channelInfo,
+          });
+        }
+
+        videoUrl = first.url;
+        title = safeFileName(first.title);
+        thumbnail = first.thumbnail;
       }
 
-      // 🔔 MENSAJE DE DESCARGA CON TARJETA
+      // Obtener info
+      const info = await fetchDirectMediaUrl({ videoUrl });
+      title = safeFileName(info.title);
+
+      if (!thumbnail) {
+        const search = await yts(videoUrl);
+        const first = search?.videos?.[0];
+        if (first) thumbnail = first.thumbnail;
+      }
+
+      // Mensaje único con imagen
       await sock.sendMessage(
         from,
         {
-          text: `🎧 *Descargando Audio...*\n\n🎵 ${title}\n⏱ ${duration}`,
-          contextInfo: {
-            externalAdReply: {
-              title: title,
-              body: `⏱ Duración: ${duration}`,
-              thumbnailUrl: thumbnail,
-              sourceUrl: videoUrl,
-              mediaType: 1,
-              renderLargerThumbnail: true,
-              showAdAttribution: false
-            }
-          },
-          ...global.channelInfo
+          image: { url: thumbnail },
+          caption: `🎵 Descargando música...\n\n🎧 ${title}`,
+          ...global.channelInfo,
         },
-        msg ? { quoted: msg } : undefined
+        quoted
       );
 
-      const apiRes = await axios.get(
-        `${API_URL}?url=${encodeURIComponent(videoUrl)}`,
-        { timeout: 25000 }
-      );
+      // Convertir directo a mp3
+      await convertToMp3(info.directUrl, finalMp3);
 
-      const directUrl = apiRes?.data?.result?.url;
+      const size = fs.existsSync(finalMp3)
+        ? fs.statSync(finalMp3).size
+        : 0;
 
-      if (!directUrl || !directUrl.startsWith("http")) {
-        throw new Error("API inválida");
-      }
+      if (!size || size < 100000)
+        throw new Error("Audio inválido");
 
-      await withGlobalLock(async () => {
-        await sock.sendMessage(
-          from,
-          {
-            audio: { url: directUrl },
-            mimetype: "audio/mpeg",
-            fileName: `${safeFileName(title)}.mp3`,
-            contextInfo: {
-              externalAdReply: {
-                title: title,
-                body: `⏱ ${duration}`,
-                thumbnailUrl: thumbnail,
-                sourceUrl: videoUrl,
-                mediaType: 1,
-                renderLargerThumbnail: true,
-                showAdAttribution: false
-              }
-            },
-            ...global.channelInfo
-          },
-          msg ? { quoted: msg } : undefined
-        );
-      });
+      if (size > MAX_AUDIO_BYTES)
+        throw new Error("Audio demasiado grande");
 
-      if (messageKey) {
-        await sock.sendMessage(from, { react: { text: "✅", key: messageKey } });
-      }
-
-    } catch (err) {
-      cooldowns.delete(from);
-      console.error("❌ YTMP3 ERROR:", err?.message || err);
-
-      if (messageKey) {
-        try {
-          await sock.sendMessage(from, { react: { text: "❌", key: messageKey } });
-        } catch {}
-      }
-
+      // Enviar como audio real (NO documento)
       await sock.sendMessage(
         from,
-        { text: "❌ No se pudo descargar el audio", ...global.channelInfo },
-        msg ? { quoted: msg } : undefined
+        {
+          audio: { url: finalMp3 },
+          mimetype: "audio/mpeg",
+          ptt: false,
+          fileName: `${title}.mp3`,
+          ...global.channelInfo,
+        },
+        quoted
       );
+
+    } catch (err) {
+      console.error("YTMP3 ERROR:", err?.message || err);
+      cooldowns.delete(userId);
+
+      await sock.sendMessage(from, {
+        text: "❌ Error al procesar la música.",
+        ...global.channelInfo,
+      });
+    } finally {
+      try {
+        if (finalMp3 && fs.existsSync(finalMp3)) {
+          fs.unlinkSync(finalMp3);
+        }
+      } catch {}
     }
   },
 };
-
-process.on("uncaughtException", (e) => console.error("Uncaught:", e));
-process.on("unhandledRejection", (e) => console.error("Unhandled:", e));
