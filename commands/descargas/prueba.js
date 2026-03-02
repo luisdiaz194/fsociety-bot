@@ -1,92 +1,51 @@
 import axios from "axios";
 
 export default {
-  name: "play",
-  command: ["play", "music"],
+  name: "dllink",
+  command: ["dllink", "linkaudio"],
   category: "descargas",
-  desc: "Descarga música de YouTube y la envía. Uso: .play <link>",
+  desc: "Obtiene el link final de descarga (resuelve redirects). Uso: .dllink <url de YouTube>",
 
   run: async ({ sock, msg, from, args, settings }) => {
-
-    const url = args[0];
-
-    if (!url) {
-      return sock.sendMessage(
-        from,
-        { text: `❌ Uso correcto:\n${settings.prefix}play <link de YouTube>`, ...global.channelInfo },
-        { quoted: msg }
-      );
+    const ytUrl = (args[0] || "").trim();
+    if (!ytUrl) {
+      return sock.sendMessage(from, { text: `Uso: ${settings.prefix}dllink <url>` , ...global.channelInfo}, { quoted: msg });
     }
 
     try {
-
-      await sock.sendMessage(
-        from,
-        { text: "🎵 Buscando música...", ...global.channelInfo },
-        { quoted: msg }
-      );
-
       const { data } = await axios.post(
         "https://api-sky.ultraplus.click/youtube/resolve",
-        {
-          url,
-          type: "audio",
-          quality: "mp3"
-        },
-        {
-          headers: {
-            "Content-Type": "application/json",
-            apikey: "DvYer159"
-          }
-        }
+        { url: ytUrl, type: "audio", quality: "mp3" },
+        { headers: { apikey: "DvYer159" }, timeout: 30000 }
       );
 
-      if (!data.status) {
-        return sock.sendMessage(
-          from,
-          { text: "❌ No se pudo obtener la música.", ...global.channelInfo },
-          { quoted: msg }
-        );
+      if (!data?.status || !data?.result) {
+        return sock.sendMessage(from, { text: `❌ API error: ${data?.message || "sin respuesta"}`, ...global.channelInfo }, { quoted: msg });
       }
 
-      const res = data.result;
+      // Ajusta si tu API lo devuelve en otra propiedad:
+      const dl = data?.result?.url || data?.result?.download_url || data?.result?.download?.url;
+      if (!dl) {
+        return sock.sendMessage(from, { text: "⚠️ No encontré link de descarga en la respuesta.", ...global.channelInfo }, { quoted: msg });
+      }
 
-      const titulo = res.title;
-      const autor = res.author?.name || "Desconocido";
-      const thumb = res.thumbnail;
-      const source = res.source?.url;
-
-      const texto = `🎧 *${titulo}*\n👤 ${autor}`;
-
-      await sock.sendMessage(
-        from,
-        {
-          image: { url: thumb },
-          caption: texto,
-          ...global.channelInfo
-        },
-        { quoted: msg }
-      );
+      // Resolver redirect (si existe) sin descargar
+      let finalUrl = dl;
+      try {
+        const head = await axios.head(dl, { maxRedirects: 0, validateStatus: () => true, timeout: 15000 });
+        if (head.status >= 300 && head.status < 400 && head.headers?.location) {
+          finalUrl = head.headers.location;
+        }
+      } catch {}
 
       await sock.sendMessage(
         from,
-        {
-          audio: { url: source },
-          mimetype: "audio/mpeg",
-          fileName: `${titulo}.mp3`,
-          ...global.channelInfo
-        },
+        { text: `✅ Link de descarga:\n${finalUrl}`, ...global.channelInfo },
         { quoted: msg }
       );
-
     } catch (e) {
-      console.error("Error en play:", e);
-
-      await sock.sendMessage(
-        from,
-        { text: "❌ Error descargando la música.", ...global.channelInfo },
-        { quoted: msg }
-      );
+      console.error("dllink error:", e);
+      await sock.sendMessage(from, { text: "❌ Error obteniendo el link.", ...global.channelInfo }, { quoted: msg });
     }
-  }
+  },
 };
