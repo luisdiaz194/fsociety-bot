@@ -31,7 +31,6 @@ const {
   DisconnectReason,
   fetchLatestBaileysVersion,
 } = baileys;
-
 import pino from "pino";
 import chalk from "chalk";
 import readline from "readline";
