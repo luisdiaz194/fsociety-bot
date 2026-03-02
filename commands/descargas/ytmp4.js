@@ -10,8 +10,9 @@ const API_KEY = "may-5d597e52";
 const COOLDOWN_TIME = 15 * 1000;
 const TMP_DIR = path.join(process.cwd(), "tmp");
 
-const MAX_VIDEO_BYTES = 64 * 1024 * 1024;
-const MAX_DOC_BYTES = 100 * 1024 * 1024;
+// ✅ NUEVOS LÍMITES
+const MAX_VIDEO_BYTES = 120 * 1024 * 1024; // 120 MB como video
+const MAX_DOC_BYTES = 200 * 1024 * 1024;   // 200 MB como documento
 
 const DEFAULT_QUALITY = "360p";
 const cooldowns = new Map();
@@ -40,7 +41,7 @@ function withoutQuality(args) {
   return args.filter((a) => !/^\d{3,4}p$/i.test(a));
 }
 
-// ✅ API call
+// API call
 async function fetchDirectMediaUrl({ videoUrl, quality }) {
   const { data } = await axios.get(API_URL, {
     timeout: 20000,
@@ -168,10 +169,11 @@ export default {
 
       const size = fs.existsSync(finalMp4) ? fs.statSync(finalMp4).size : 0;
       if (!size || size < 300000) throw new Error("Archivo final inválido");
-      if (size > MAX_DOC_BYTES) throw new Error("Archivo demasiado grande para enviar.");
 
-      // (Opcional) intentar editar el mensaje (si tu lib lo soporta)
-      // Si no soporta, no pasa nada.
+      // ✅ NUEVO LIMITE DOCUMENTO 200MB
+      if (size > MAX_DOC_BYTES) throw new Error("Archivo demasiado grande para enviar (máx 200MB).");
+
+      // (Opcional) editar el mensaje a “enviando”
       try {
         if (infoMsg?.key) {
           await sock.sendMessage(from, {
@@ -182,7 +184,7 @@ export default {
         }
       } catch {}
 
-      // Enviar video o documento
+      // ✅ NUEVO LIMITE VIDEO 120MB
       if (size <= MAX_VIDEO_BYTES) {
         await sock.sendMessage(
           from,
