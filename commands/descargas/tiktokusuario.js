@@ -4,17 +4,22 @@ export default {
   name: "tiktokusuario",
   command: ["tiktokusuario", "ttuser", "ttperfil"],
   category: "descarga",
-  desc: "Busca un usuario de TikTok y envía sus 3 primeros videos",
+  desc: "Busca videos de un usuario específico en TikTok y envía 3 resultados",
 
   run: async ({ sock, msg, from, args, settings }) => {
 
-    const username = args.join(" ").replace("@", "").trim();
+    const username = args.join(" ").replace("@", "").trim().toLowerCase();
 
     if (!username) {
       return sock.sendMessage(
         from,
         {
-          text: `╭─❍ *USO INCORRECTO* ❍\n│\n│ ✘ Ejemplo:\n│ ${settings.prefix}tiktokusuario goku\n│ ${settings.prefix}tiktokusuario @goku\n╰───────────────`,
+          text:
+`╭─❍ *USO CORRECTO* ❍
+│
+│ ${settings.prefix}tiktokusuario usuario
+│ ${settings.prefix}tiktokusuario @usuario
+╰───────────────`,
           ...global.channelInfo
         },
         { quoted: msg }
@@ -23,59 +28,50 @@ export default {
 
     try {
 
-      // API ejemplo (debes usar una que devuelva info de perfil + videos)
-      const api = `https://nexevo.onrender.com/stalk/tiktok?username=${encodeURIComponent(username)}`;
+      // Usamos la misma búsqueda que tu comando anterior
+      const api = `https://nexevo.onrender.com/search/tiktok?q=${encodeURIComponent(username)}`;
 
       const { data } = await axios.get(api);
 
-      if (!data?.status || !data?.result) {
+      if (!data?.status || !data?.result?.length) {
         return sock.sendMessage(
           from,
-          {
-            text: "❌ No encontré ese usuario en TikTok.",
-            ...global.channelInfo
-          },
+          { text: "❌ No encontré resultados.", ...global.channelInfo },
           { quoted: msg }
         );
       }
 
-      const user = data.result.user;
-      const videos = data.result.videos?.slice(0, 3);
+      // 🔎 Filtrar solo videos que sean del usuario exacto
+      const filtered = data.result.filter(v => 
+        v?.author?.unique_id?.toLowerCase() === username
+      );
 
-      // 📌 Enviar info del perfil
+      if (!filtered.length) {
+        return sock.sendMessage(
+          from,
+          { text: "⚠️ No encontré videos de ese usuario específico.", ...global.channelInfo },
+          { quoted: msg }
+        );
+      }
+
+      const results = filtered.slice(0, 3); // solo 3 videos
+
+      // 📌 Mensaje inicial
       await sock.sendMessage(
         from,
         {
-          image: { url: user.avatar },
-          caption:
-`╭━━〔 👤 PERFIL TIKTOK 〕━━⬣
-┃ 🏷 Usuario: @${user.unique_id}
-┃ 📛 Nombre: ${user.nickname}
-┃ 👥 Seguidores: ${user.follower_count}
-┃ 👤 Siguiendo: ${user.following_count}
-┃ ❤️ Likes: ${user.total_favorited}
-┃ 🎬 Videos: ${user.aweme_count}
-╰━━━━━━━━━━━━━━━━━━⬣`,
+          text: `🔎 Resultados del usuario *@${username}*\n🎬 Enviando ${results.length} videos...`,
           ...global.channelInfo
         },
         { quoted: msg }
       );
 
-      if (!videos?.length) {
-        return sock.sendMessage(
-          from,
-          {
-            text: "⚠️ El usuario no tiene videos públicos.",
-            ...global.channelInfo
-          },
-          { quoted: msg }
-        );
-      }
+      // 🎬 Enviar videos
+      for (let i = 0; i < results.length; i++) {
 
-      // 🎬 Enviar 3 primeros videos
-      for (let i = 0; i < videos.length; i++) {
-
-        const v = videos[i];
+        const v = results[i];
+        const title = v.title || "Video TikTok";
+        const author = v?.author?.unique_id || "usuario";
 
         await sock.sendMessage(
           from,
@@ -83,9 +79,11 @@ export default {
             video: { url: v.play },
             caption:
 `╭─❍ *VIDEO ${i + 1}* ❍
-│ 📝 ${v.title || "Sin descripción"}
-│ ❤️ ${v.digg_count}  💬 ${v.comment_count}
-│ 🔁 ${v.share_count} 👁 ${v.play_count}
+│ 🎬 ${title}
+│ 👤 @${author}
+│ ❤️ ${v.digg_count || 0}
+│ 💬 ${v.comment_count || 0}
+│ 👁 ${v.play_count || 0}
 ╰───────────────`,
             ...global.channelInfo
           },
@@ -100,7 +98,7 @@ export default {
       await sock.sendMessage(
         from,
         {
-          text: "❌ Ocurrió un error al obtener el perfil.",
+          text: "❌ Error obteniendo los videos.",
           ...global.channelInfo
         },
         { quoted: msg }
