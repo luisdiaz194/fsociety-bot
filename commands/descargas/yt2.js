@@ -4,297 +4,151 @@ import axios from "axios";
 import yts from "yt-search";
 import { execSync } from "child_process";
 
-const API_URL = "https://nexevo.onrender.com/download/y2";
-
-const COOLDOWN_TIME = 15 * 1000;
-const DEFAULT_QUALITY = "360p";
+const API_URL = "https://api.nexevodownloader.com/ytdl"; // 🔁 cambia si tu endpoint es otro
+const API_KEY = "TU_API_KEY_AQUI";
 
 const TMP_DIR = path.join(process.cwd(), "tmp");
+const MAX_VIDEO_BYTES = 150 * 1024 * 1024; // 150MB
+const QUALITY = "360";
 
-// límites
-const MAX_VIDEO_BYTES = 70 * 1024 * 1024;
-const MAX_DOC_BYTES = 2 * 1024 * 1024 * 1024;
-const MIN_FREE_BYTES = 350 * 1024 * 1024;
-const MIN_VALID_BYTES = 300000;
-const CLEANUP_MAX_AGE_MS = 2 * 60 * 60 * 1000;
-
-const cooldowns = new Map();
-const locks = new Set();
-
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-if (!fs.existsSync(TMP_DIR)) fs.mkdirSync(TMP_DIR, { recursive: true });
+if (!fs.existsSync(TMP_DIR)) {
+  fs.mkdirSync(TMP_DIR, { recursive: true });
+}
 
 function safeFileName(name) {
-  return (String(name || "video")
+  return (name || "video")
     .replace(/[\\/:*?"<>|]/g, "")
-    .replace(/\s+/g, " ")
-    .trim()
-    .slice(0, 80) || "video");
+    .slice(0, 80);
 }
 
-function isHttpUrl(s) {
-  return /^https?:\/\//i.test(String(s || ""));
+async function searchVideo(query) {
+  const res = await yts(query);
+  if (!res.videos.length) return null;
+  return res.videos[0];
 }
 
-function getCooldownRemaining(untilMs) {
-  return Math.max(0, Math.ceil((untilMs - Date.now()) / 1000));
-}
-
-function getYoutubeId(url) {
-  try {
-    const u = new URL(url);
-    if (u.hostname.includes("youtu.be")) return u.pathname.replace("/", "").trim();
-    const v = u.searchParams.get("v");
-    if (v) return v.trim();
-    return null;
-  } catch {
-    return null;
-  }
-}
-
-function cleanupTmp(maxAgeMs = CLEANUP_MAX_AGE_MS) {
-  try {
-    const now = Date.now();
-    for (const f of fs.readdirSync(TMP_DIR)) {
-      const p = path.join(TMP_DIR, f);
-      try {
-        const st = fs.statSync(p);
-        if (st.isFile() && (now - st.mtimeMs) > maxAgeMs) fs.unlinkSync(p);
-      } catch {}
-    }
-  } catch {}
-}
-
-function getFreeBytes(dir) {
-  try {
-    const out = execSync(`df -k "${dir}" | tail -1 | awk '{print $4}'`)
-      .toString()
-      .trim();
-    const freeKb = Number(out);
-    return Number.isFinite(freeKb) ? freeKb * 1024 : null;
-  } catch {
-    return null;
-  }
-}
-
-// 🔥 NUEVA API NEXEVO (SIEMPRE 360P)
-async function fetchDirectMediaUrl({ videoUrl }) {
+async function getDownloadUrl(url) {
   const { data } = await axios.get(API_URL, {
-    timeout: 25000,
-    params: { url: videoUrl },
-    validateStatus: (s) => s >= 200 && s < 500,
+    params: {
+      url,
+      quality: QUALITY,
+      apikey: API_KEY
+    },
+    timeout: 30000
   });
 
   if (!data?.status || !data?.result?.url) {
-    throw new Error("API Nexevo inválida o sin URL directa.");
+    throw new Error("API no devolvió enlace válido");
   }
 
   return {
-    title: data?.result?.info?.title || "video",
-    directUrl: data.result.url,
-    thumbnail: data?.result?.info?.thumbnail || null,
+    title: data.result.title,
+    downloadUrl: data.result.url
   };
 }
 
-async function resolveVideoInfo(queryOrUrl) {
-  if (!isHttpUrl(queryOrUrl)) {
-    const search = await yts(queryOrUrl);
-    const first = search?.videos?.[0];
-    if (!first) return null;
-    return {
-      videoUrl: first.url,
-      title: safeFileName(first.title),
-      thumbnail: first.thumbnail || null,
-    };
-  }
-
-  const vid = getYoutubeId(queryOrUrl);
-  if (vid) {
-    try {
-      const info = await yts({ videoId: vid });
-      if (info)
-        return {
-          videoUrl: info.url || queryOrUrl,
-          title: safeFileName(info.title),
-          thumbnail: info.thumbnail || null,
-        };
-    } catch {}
-  }
-
-  return { videoUrl: queryOrUrl, title: "video", thumbnail: null };
-}
-
-async function headContentLength(url) {
-  try {
-    const r = await axios.head(url, { timeout: 15000, maxRedirects: 5 });
-    const len = Number(r.headers["content-length"]);
-    return Number.isFinite(len) ? len : null;
-  } catch {
-    return null;
-  }
-}
-
-async function trySendByUrl(sock, from, quoted, directUrl, title) {
-  try {
-    await sock.sendMessage(from, {
-      video: { url: directUrl },
-      mimetype: "video/mp4",
-      caption: `🎬 ${title}`,
-      ...global.channelInfo,
-    }, quoted);
-    return "video-url";
-  } catch {
-    await sock.sendMessage(from, {
-      document: { url: directUrl },
-      mimetype: "video/mp4",
-      fileName: `${title}.mp4`,
-      caption: `📄 ${title}`,
-      ...global.channelInfo,
-    }, quoted);
-    return "doc-url";
-  }
-}
-
-async function downloadToFileWithLimit(directUrl, outPath, maxBytes) {
-  const partPath = `${outPath}.part`;
-  let downloaded = 0;
-
-  const res = await axios.get(directUrl, {
+async function downloadFile(url, outputPath) {
+  const response = await axios({
+    url,
+    method: "GET",
     responseType: "stream",
-    timeout: 120000,
+    headers: { "User-Agent": "Mozilla/5.0" }
   });
 
-  const writer = fs.createWriteStream(partPath);
+  const writer = fs.createWriteStream(outputPath);
+  response.data.pipe(writer);
 
-  const done = new Promise((resolve, reject) => {
-    res.data.on("data", (chunk) => {
-      downloaded += chunk.length;
-      if (downloaded > maxBytes) {
-        res.data.destroy(new Error("Archivo supera límite"));
-      }
-    });
-
-    res.data.pipe(writer);
+  await new Promise((resolve, reject) => {
     writer.on("finish", resolve);
     writer.on("error", reject);
   });
-
-  await done;
-
-  const size = fs.statSync(partPath).size;
-  if (size < MIN_VALID_BYTES) throw new Error("Archivo inválido");
-
-  fs.renameSync(partPath, outPath);
-  return size;
 }
 
-async function sendByFile(sock, from, quoted, filePath, title, size) {
-  if (size <= MAX_VIDEO_BYTES) {
-    await sock.sendMessage(from, {
-      video: { url: filePath },
-      mimetype: "video/mp4",
-      caption: `🎬 ${title}`,
-      ...global.channelInfo,
-    }, quoted);
-    return;
-  }
+function convertToWhatsAppCompatible(inputPath) {
+  const outputPath = inputPath.replace(".mp4", "_fixed.mp4");
 
-  await sock.sendMessage(from, {
-    document: { url: filePath },
-    mimetype: "video/mp4",
-    fileName: `${title}.mp4`,
-    caption: `📄 ${title}`,
-    ...global.channelInfo,
-  }, quoted);
+  execSync(`
+    ffmpeg -y -i "${inputPath}" \
+    -c:v libx264 \
+    -preset veryfast \
+    -profile:v baseline \
+    -level 3.0 \
+    -movflags +faststart \
+    -c:a aac \
+    -b:a 128k \
+    "${outputPath}"
+  `);
+
+  fs.unlinkSync(inputPath);
+  return outputPath;
 }
 
 export default {
-  command: ["ytmp4", "yt2"], // 🔥 agregado yt2
-  category: "descarga",
+  command: ["yt2"],
+  category: "descargas",
 
-  run: async (ctx) => {
-    const { sock, from, args } = ctx;
-    const msg = ctx.m || ctx.msg || null;
-    const userId = from;
-
-    if (locks.has(from)) {
+  run: async ({ sock, from, args, m }) => {
+    if (!args.length) {
       return sock.sendMessage(from, {
-        text: "⏳ Ya estoy procesando otro video aquí.",
-        ...global.channelInfo,
+        text: "❌ Uso: .yt2 nombre o link",
       });
     }
-
-    const until = cooldowns.get(userId);
-    if (until && until > Date.now()) {
-      return sock.sendMessage(from, {
-        text: `⏳ Espera ${getCooldownRemaining(until)}s`,
-        ...global.channelInfo,
-      });
-    }
-
-    cooldowns.set(userId, Date.now() + COOLDOWN_TIME);
-    const quoted = msg?.key ? { quoted: msg } : undefined;
-
-    let outFile = null;
 
     try {
-      locks.add(from);
-      cleanupTmp();
+      const query = args.join(" ");
+      let videoUrl = query;
+      let title = "video";
 
-      if (!args?.length) {
-        cooldowns.delete(userId);
-        return sock.sendMessage(from, {
-          text: "❌ Uso: .yt2 <nombre o link>",
-          ...global.channelInfo,
-        });
+      if (!query.startsWith("http")) {
+        const search = await searchVideo(query);
+        if (!search) {
+          return sock.sendMessage(from, { text: "❌ No se encontró el video." });
+        }
+        videoUrl = search.url;
+        title = safeFileName(search.title);
       }
 
-      const query = args.join(" ").trim();
-      const meta = await resolveVideoInfo(query);
-      if (!meta) throw new Error("No se encontró el video.");
+      await sock.sendMessage(from, {
+        text: "🔎 Buscando y procesando video en 360p..."
+      }, { quoted: m });
 
-      let { videoUrl, title, thumbnail } = meta;
+      const apiData = await getDownloadUrl(videoUrl);
+      title = safeFileName(apiData.title);
 
-      if (thumbnail) {
+      const tempPath = path.join(TMP_DIR, `${Date.now()}.mp4`);
+
+      // Descargar
+      await downloadFile(apiData.downloadUrl, tempPath);
+
+      // Convertir compatible WhatsApp
+      const fixedPath = convertToWhatsAppCompatible(tempPath);
+
+      const stats = fs.statSync(fixedPath);
+      const size = stats.size;
+
+      // Enviar según tamaño
+      if (size <= MAX_VIDEO_BYTES) {
         await sock.sendMessage(from, {
-          image: { url: thumbnail },
-          caption: `⬇️ Descargando en 360p...\n\n🎬 ${title}`,
-          ...global.channelInfo,
-        }, quoted);
+          video: fs.readFileSync(fixedPath),
+          mimetype: "video/mp4",
+          caption: `🎬 ${title}\n📺 Calidad: 360p`
+        }, { quoted: m });
+      } else {
+        await sock.sendMessage(from, {
+          document: fs.readFileSync(fixedPath),
+          mimetype: "video/mp4",
+          fileName: `${title}.mp4`,
+          caption: `📄 ${title}\n📺 Calidad: 360p`
+        }, { quoted: m });
       }
 
-      const info = await fetchDirectMediaUrl({ videoUrl });
-      title = safeFileName(info.title || title);
-
-      const len = await headContentLength(info.directUrl);
-      if (len && len > MAX_DOC_BYTES)
-        throw new Error("Archivo supera el límite de 2GB.");
-
-      const free = getFreeBytes(TMP_DIR);
-      if (free != null && free < MIN_FREE_BYTES) {
-        await trySendByUrl(sock, from, quoted, info.directUrl, title);
-        return;
-      }
-
-      try {
-        await trySendByUrl(sock, from, quoted, info.directUrl, title);
-        return;
-      } catch {}
-
-      outFile = path.join(TMP_DIR, `${Date.now()}.mp4`);
-      const size = await downloadToFileWithLimit(info.directUrl, outFile, MAX_DOC_BYTES);
-      await sendByFile(sock, from, quoted, outFile, title, size);
+      fs.unlinkSync(fixedPath);
 
     } catch (err) {
-      cooldowns.delete(userId);
+      console.error(err);
       await sock.sendMessage(from, {
-        text: `❌ ${err.message}`,
-        ...global.channelInfo,
+        text: "❌ Error al procesar el video."
       });
-    } finally {
-      locks.delete(from);
-      try { if (outFile && fs.existsSync(outFile)) fs.unlinkSync(outFile); } catch {}
     }
-  },
+  }
 };
