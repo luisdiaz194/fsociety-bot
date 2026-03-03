@@ -5,7 +5,7 @@ import yts from "yt-search";
 import { execSync } from "child_process";
 
 const API_URL = "https://mayapi.ooguy.com/ytdl";
-const API_KEY = "may-a709a21d";
+const API_KEY = "may-ad025b11";
 
 const COOLDOWN_TIME = 15 * 1000;
 const DEFAULT_QUALITY = "360p";
