@@ -8,8 +8,6 @@ const API_URL = "https://mayapi.ooguy.com/ytdl";
 
 // 🔁 ROTACIÓN DE API KEYS
 const API_KEYS = [
-  //"may-ad025b11",
-  //"may-3e5a03fa",
   "may-1285f1e9",
   "may-5793b618",
   "may-72e941fc",
@@ -30,11 +28,11 @@ const DEFAULT_QUALITY = "360p";
 const TMP_DIR = path.join(process.cwd(), "tmp");
 
 // límites
-const MAX_VIDEO_BYTES = 70 * 1024 * 1024;        
-const MAX_DOC_BYTES = 2 * 1024 * 1024 * 1024;    
-const MIN_FREE_BYTES = 350 * 1024 * 1024;        
-const MIN_VALID_BYTES = 300000;                  
-const CLEANUP_MAX_AGE_MS = 2 * 60 * 60 * 1000;   
+const MAX_VIDEO_BYTES = 70 * 1024 * 1024;
+const MAX_DOC_BYTES = 2 * 1024 * 1024 * 1024;
+const MIN_FREE_BYTES = 350 * 1024 * 1024;
+const MIN_VALID_BYTES = 300000;
+const CLEANUP_MAX_AGE_MS = 2 * 60 * 60 * 1000;
 
 const cooldowns = new Map();
 const locks = new Set();
@@ -42,6 +40,10 @@ const locks = new Set();
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 if (!fs.existsSync(TMP_DIR)) fs.mkdirSync(TMP_DIR, { recursive: true });
+
+const channelInfo = global.channelInfo || {};
+
+// ---------- utilidades ----------
 
 function safeFileName(name) {
   return (String(name || "video")
@@ -71,46 +73,63 @@ function getCooldownRemaining(untilMs) {
 function getYoutubeId(url) {
   try {
     const u = new URL(url);
-    if (u.hostname.includes("youtu.be")) return u.pathname.replace("/", "").trim();
+
+    if (u.hostname.includes("youtu.be")) {
+      return u.pathname.replace("/", "").trim();
+    }
+
     const v = u.searchParams.get("v");
     if (v) return v.trim();
+
     const parts = u.pathname.split("/").filter(Boolean);
-    const idxShorts = parts.indexOf("shorts");
-    if (idxShorts >= 0 && parts[idxShorts + 1]) return parts[idxShorts + 1].trim();
-    const idxEmbed = parts.indexOf("embed");
-    if (idxEmbed >= 0 && parts[idxEmbed + 1]) return parts[idxEmbed + 1].trim();
+
+    const shorts = parts.indexOf("shorts");
+    if (shorts >= 0) return parts[shorts + 1];
+
+    const embed = parts.indexOf("embed");
+    if (embed >= 0) return parts[embed + 1];
+
     return null;
   } catch {
     return null;
   }
 }
 
-// --------- Limpieza automática ----------
+// --------- limpieza ----------
 function cleanupTmp(maxAgeMs = CLEANUP_MAX_AGE_MS) {
   try {
     const now = Date.now();
-    for (const f of fs.readdirSync(TMP_DIR)) {
-      const p = path.join(TMP_DIR, f);
+
+    for (const file of fs.readdirSync(TMP_DIR)) {
+      const p = path.join(TMP_DIR, file);
+
       try {
         const st = fs.statSync(p);
-        if (st.isFile() && (now - st.mtimeMs) > maxAgeMs) fs.unlinkSync(p);
+
+        if (st.isFile() && now - st.mtimeMs > maxAgeMs) {
+          fs.unlinkSync(p);
+        }
       } catch {}
     }
   } catch {}
 }
 
-// --------- Espacio libre ----------
+// --------- espacio libre ----------
 function getFreeBytes(dir) {
   try {
-    const out = execSync(`df -k "${dir}" | tail -1 | awk '{print $4}'`).toString().trim();
+    const out = execSync(`df -k "${dir}" | tail -1 | awk '{print $4}'`)
+      .toString()
+      .trim();
+
     const freeKb = Number(out);
+
     return Number.isFinite(freeKb) ? freeKb * 1024 : null;
   } catch {
     return null;
   }
 }
 
-// 🔁 FUNCIÓN MODIFICADA SOLO PARA ROTACIÓN
+// ---------- API ----------
 async function fetchDirectMediaUrl({ videoUrl, quality }) {
   let lastError = null;
 
@@ -120,184 +139,220 @@ async function fetchDirectMediaUrl({ videoUrl, quality }) {
     try {
       const { data } = await axios.get(API_URL, {
         timeout: 25000,
-        params: { url: videoUrl, quality, apikey: currentKey },
-        validateStatus: (s) => s >= 200 && s < 500,
+        params: {
+          url: videoUrl,
+          quality,
+          apikey: currentKey
+        },
+        validateStatus: (s) => s >= 200 && s < 500
       });
 
       if (data?.status && data?.result?.url) {
         return {
-          title: data?.result?.title || "video",
-          directUrl: data.result.url,
+          title: data.result.title || "video",
+          directUrl: data.result.url
         };
       }
 
       lastError = new Error(data?.message || "API sin URL válida");
-
     } catch (err) {
       lastError = err;
     }
   }
 
-  throw new Error(lastError?.message || "Todas las API Keys fallaron.");
+  throw new Error(lastError?.message || "Todas las API Keys fallaron");
 }
 
+// ---------- buscar video ----------
 async function resolveVideoInfo(queryOrUrl) {
-  if (!isHttpUrl(queryOrUrl)) {
-    const search = await yts(queryOrUrl);
-    const first = search?.videos?.[0];
-    if (!first) return null;
-    return { videoUrl: first.url, title: safeFileName(first.title), thumbnail: first.thumbnail || null };
-  }
-
-  const vid = getYoutubeId(queryOrUrl);
-  if (vid) {
-    try {
-      const info = await yts({ videoId: vid });
-      if (info) return { videoUrl: info.url || queryOrUrl, title: safeFileName(info.title), thumbnail: info.thumbnail || null };
-    } catch {}
-  }
-
   try {
-    const search = await yts(queryOrUrl);
-    const first = search?.videos?.[0];
-    if (first) return { videoUrl: first.url || queryOrUrl, title: safeFileName(first.title), thumbnail: first.thumbnail || null };
-  } catch {}
+    if (!isHttpUrl(queryOrUrl)) {
+      const search = await yts(queryOrUrl);
+      const first = search?.videos?.[0];
 
-  return { videoUrl: queryOrUrl, title: "video", thumbnail: null };
+      if (!first) return null;
+
+      return {
+        videoUrl: first.url,
+        title: safeFileName(first.title),
+        thumbnail: first.thumbnail || null
+      };
+    }
+
+    const vid = getYoutubeId(queryOrUrl);
+
+    if (vid) {
+      const info = await yts({ videoId: vid });
+
+      if (info) {
+        return {
+          videoUrl: info.url || queryOrUrl,
+          title: safeFileName(info.title),
+          thumbnail: info.thumbnail || null
+        };
+      }
+    }
+
+    return {
+      videoUrl: queryOrUrl,
+      title: "video",
+      thumbnail: null
+    };
+  } catch {
+    return null;
+  }
 }
 
+// ---------- HEAD ----------
 async function headContentLength(url) {
   try {
-    const r = await axios.head(url, { timeout: 15000, maxRedirects: 5 });
+    const r = await axios.head(url, {
+      timeout: 15000,
+      maxRedirects: 5
+    });
+
     const len = Number(r.headers["content-length"]);
+
     return Number.isFinite(len) ? len : null;
   } catch {
     return null;
   }
 }
 
-// --------- Intento 1: enviar por URL ----------
+// ---------- enviar por url ----------
 async function trySendByUrl(sock, from, quoted, directUrl, title) {
   try {
-    await sock.sendMessage(from, {
-      video: { url: directUrl },
-      mimetype: "video/mp4",
-      caption: `🎬 ${title}`,
-      ...global.channelInfo,
-    }, quoted);
-    return "video-url";
-  } catch (e1) {
-    try {
-      await sock.sendMessage(from, {
-        document: { url: directUrl },
+    await sock.sendMessage(
+      from,
+      {
+        video: { url: directUrl },
         mimetype: "video/mp4",
-        fileName: `${title}.mp4`,
-        caption: `📄 Enviado como documento\n🎬 ${title}`,
-        ...global.channelInfo,
-      }, quoted);
-      return "doc-url";
-    } catch (e2) {
-      const err = new Error(`No se pudo enviar por URL: ${e2?.message || e2}`);
-      err._cause1 = e1;
-      err._cause2 = e2;
-      throw err;
-    }
-  }
+        caption: `🎬 ${title}`,
+        ...channelInfo
+      },
+      quoted
+    );
+
+    return;
+  } catch {}
+
+  await sock.sendMessage(
+    from,
+    {
+      document: { url: directUrl },
+      mimetype: "video/mp4",
+      fileName: `${title}.mp4`,
+      caption: `📄 ${title}`,
+      ...channelInfo
+    },
+    quoted
+  );
 }
 
-async function downloadToFileWithLimit(directUrl, outPath, maxBytes) {
-  const partPath = `${outPath}.part`;
-  try { if (fs.existsSync(partPath)) fs.unlinkSync(partPath); } catch {}
-  try { if (fs.existsSync(outPath)) fs.unlinkSync(outPath); } catch {}
+// ---------- descargar ----------
+async function downloadToFileWithLimit(url, outPath, maxBytes) {
+  const part = `${outPath}.part`;
 
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    let writer = null;
-    let downloaded = 0;
+  try {
+    if (fs.existsSync(part)) fs.unlinkSync(part);
+  } catch {}
 
-    try {
-      const res = await axios.get(directUrl, {
-        responseType: "stream",
-        timeout: 120000,
-        headers: { "User-Agent": "Mozilla/5.0" },
-        maxRedirects: 5,
-        validateStatus: (s) => s >= 200 && s < 400,
-      });
+  let downloaded = 0;
 
-      writer = fs.createWriteStream(partPath);
+  const res = await axios.get(url, {
+    responseType: "stream",
+    timeout: 120000,
+    headers: { "User-Agent": "Mozilla/5.0" }
+  });
 
-      const done = new Promise((resolve, reject) => {
-        res.data.on("data", (chunk) => {
-          downloaded += chunk.length;
-          if (downloaded > maxBytes) {
-            res.data.destroy(new Error("Archivo supera el límite permitido"));
-          }
-        });
+  const writer = fs.createWriteStream(part);
 
-        res.data.on("error", reject);
-        writer.on("error", reject);
-        writer.on("finish", resolve);
+  const done = new Promise((resolve, reject) => {
+    res.data.on("data", (chunk) => {
+      downloaded += chunk.length;
 
-        res.data.pipe(writer);
-      });
+      if (downloaded > maxBytes) {
+        res.data.destroy(new Error("Archivo demasiado grande"));
+      }
+    });
 
-      await done;
+    res.data.on("error", reject);
+    writer.on("error", reject);
+    writer.on("finish", resolve);
 
-      const size = fs.existsSync(partPath) ? fs.statSync(partPath).size : 0;
-      if (size < MIN_VALID_BYTES) throw new Error("Archivo incompleto o inválido");
+    res.data.pipe(writer);
+  });
 
-      fs.renameSync(partPath, outPath);
-      return size;
+  await done;
 
-    } catch (err) {
-      try { writer?.close?.(); } catch {}
-      try { if (fs.existsSync(partPath)) fs.unlinkSync(partPath); } catch {}
-      if (attempt === 3) throw err;
-      await sleep(1200 * attempt);
-    }
+  const size = fs.statSync(part).size;
+
+  if (size < MIN_VALID_BYTES) {
+    throw new Error("Archivo incompleto");
   }
+
+  fs.renameSync(part, outPath);
+
+  return size;
 }
 
+// ---------- enviar archivo ----------
 async function sendByFile(sock, from, quoted, filePath, title, size) {
   if (size <= MAX_VIDEO_BYTES) {
-    await sock.sendMessage(from, {
-      video: { url: filePath },
-      mimetype: "video/mp4",
-      caption: `🎬 ${title}`,
-      ...global.channelInfo,
-    }, quoted);
-    return "video-file";
+    await sock.sendMessage(
+      from,
+      {
+        video: { url: filePath },
+        mimetype: "video/mp4",
+        caption: `🎬 ${title}`,
+        ...channelInfo
+      },
+      quoted
+    );
+
+    return;
   }
 
-  await sock.sendMessage(from, {
-    document: { url: filePath },
-    mimetype: "video/mp4",
-    fileName: `${title}.mp4`,
-    caption: `📄 Enviado como documento\n🎬 ${title}`,
-    ...global.channelInfo,
-  }, quoted);
-  return "doc-file";
+  await sock.sendMessage(
+    from,
+    {
+      document: { url: filePath },
+      mimetype: "video/mp4",
+      fileName: `${title}.mp4`,
+      caption: `📄 ${title}`,
+      ...channelInfo
+    },
+    quoted
+  );
 }
 
+// ---------- comando ----------
 export default {
   command: ["ytmp4", "yt2", "ytmp4doc"],
   category: "descarga",
 
   run: async (ctx) => {
     const { sock, from, args } = ctx;
-    const msg = ctx.m || ctx.msg || null;
+    const msg = ctx.m || ctx.msg;
+
     const userId = from;
 
     if (locks.has(from)) {
-      return sock.sendMessage(from, { text: "⏳ Ya estoy procesando otro video aquí. Espera un momento.", ...global.channelInfo });
+      return sock.sendMessage(from, {
+        text: "⏳ Ya estoy procesando otro video.",
+        ...channelInfo
+      });
     }
 
     const until = cooldowns.get(userId);
+
     if (until && until > Date.now()) {
       return sock.sendMessage(from, {
         text: `⏳ Espera ${getCooldownRemaining(until)}s`,
-        ...global.channelInfo,
+        ...channelInfo
       });
     }
+
     cooldowns.set(userId, Date.now() + COOLDOWN_TIME);
 
     const quoted = msg?.key ? { quoted: msg } : undefined;
@@ -306,81 +361,88 @@ export default {
 
     try {
       locks.add(from);
+
       cleanupTmp();
 
       if (!args?.length) {
         cooldowns.delete(userId);
-        return sock.sendMessage(from, { text: "❌ Uso: .ytmp4 (360p) <nombre o link>", ...global.channelInfo });
+
+        return sock.sendMessage(from, {
+          text: "❌ Uso: .ytmp4 <nombre o link>",
+          ...channelInfo
+        });
       }
 
       const quality = parseQuality(args);
       const query = withoutQuality(args).join(" ").trim();
-      if (!query) {
-        cooldowns.delete(userId);
-        return sock.sendMessage(from, { text: "❌ Debes poner un nombre o link.", ...global.channelInfo });
-      }
 
       const meta = await resolveVideoInfo(query);
+
       if (!meta) {
         cooldowns.delete(userId);
-        return sock.sendMessage(from, { text: "❌ No se encontró el video.", ...global.channelInfo });
+
+        return sock.sendMessage(from, {
+          text: "❌ No se encontró el video",
+          ...channelInfo
+        });
       }
 
       let { videoUrl, title, thumbnail } = meta;
 
-      if (thumbnail) {
-        await sock.sendMessage(from, {
-          image: { url: thumbnail },
-          caption: `⬇️ Procesando...\n\n🎬 ${title}\n🎚️ Calidad: ${quality}\n⏳ Espera por favor...`,
-          ...global.channelInfo,
-        }, quoted);
-      } else {
-        await sock.sendMessage(from, {
-          text: `⬇️ Procesando...\n\n🎬 ${title}\n🎚️ Calidad: ${quality}\n⏳ Espera por favor...`,
-          ...global.channelInfo,
-        }, quoted);
-      }
+      await sock.sendMessage(
+        from,
+        {
+          text: `⬇️ Descargando...\n\n🎬 ${title}\n🎚️ ${quality}`,
+          ...channelInfo
+        },
+        quoted
+      );
 
-      const info = await fetchDirectMediaUrl({ videoUrl, quality });
+      const info = await fetchDirectMediaUrl({
+        videoUrl,
+        quality
+      });
+
       title = safeFileName(info.title || title);
 
       const len = await headContentLength(info.directUrl);
-      if (len && len > MAX_DOC_BYTES) {
-        throw new Error("❌ Ese archivo supera el límite configurado (2GB).");
-      }
 
-      const free = getFreeBytes(TMP_DIR);
-      if (free != null && free < MIN_FREE_BYTES) {
-        try {
-          await trySendByUrl(sock, from, quoted, info.directUrl, title);
-          return;
-        } catch {
-          throw new Error("❌ Poco espacio libre para procesar el video.");
-        }
+      if (len && len > MAX_DOC_BYTES) {
+        throw new Error("Archivo demasiado grande");
       }
 
       try {
         await trySendByUrl(sock, from, quoted, info.directUrl, title);
         return;
-      } catch (e) {
-        console.error("URL send failed, fallback to file:", e?.message || e);
-      }
+      } catch {}
 
-      outFile = path.join(TMP_DIR, `${Date.now()}-${Math.random().toString(16).slice(2)}.mp4`);
-      const size = await downloadToFileWithLimit(info.directUrl, outFile, MAX_DOC_BYTES);
+      outFile = path.join(
+        TMP_DIR,
+        `${Date.now()}-${Math.random().toString(16).slice(2)}.mp4`
+      );
+
+      const size = await downloadToFileWithLimit(
+        info.directUrl,
+        outFile,
+        MAX_DOC_BYTES
+      );
+
       await sendByFile(sock, from, quoted, outFile, title, size);
-
     } catch (err) {
-      console.error("YTMP4 PRO ERROR:", err?.message || err);
+      console.error("YTMP4 ERROR:", err);
+
       cooldowns.delete(userId);
+
       await sock.sendMessage(from, {
-        text: `❌ ${String(err?.message || "Error al procesar el video.")}`,
-        ...global.channelInfo,
+        text: `❌ ${err.message || "Error al procesar el video"}`,
+        ...channelInfo
       });
     } finally {
       locks.delete(from);
-      try { if (outFile && fs.existsSync(outFile)) fs.unlinkSync(outFile); } catch {}
-      try { if (outFile && fs.existsSync(`${outFile}.part`)) fs.unlinkSync(`${outFile}.part`); } catch {}
+
+      try {
+        if (outFile && fs.existsSync(outFile)) fs.unlinkSync(outFile);
+      } catch {}
     }
-  },
+  }
 };
