@@ -6,6 +6,8 @@ import yts from "yt-search";
 const API = "https://nexevo.onrender.com/download/y";
 const TMP_DIR = path.join(process.cwd(),"tmp");
 
+const channelInfo = global.channelInfo || {};
+
 if(!fs.existsSync(TMP_DIR))
 fs.mkdirSync(TMP_DIR,{recursive:true});
 
@@ -27,7 +29,8 @@ const msg = ctx.m || ctx.msg;
 
 if(!args.length){
 return sock.sendMessage(from,{
-text:"❌ Uso: .play canción"
+text:"❌ Uso: .play canción",
+...channelInfo
 });
 }
 
@@ -43,13 +46,15 @@ const video = search.videos[0];
 
 if(!video){
 return sock.sendMessage(from,{
-text:"❌ No encontré resultados"
+text:"❌ No encontré resultados",
+...channelInfo
 });
 }
 
 await sock.sendMessage(from,{
 image:{url:video.thumbnail},
-caption:`🎵 Descargando música...\n\n${video.title}`
+caption:`🎵 Descargando música...\n\n${video.title}`,
+...channelInfo
 },{quoted:msg});
 
 const {data} = await axios.get(API,{
@@ -80,7 +85,8 @@ await new Promise(r=>writer.on("finish",r));
 await sock.sendMessage(from,{
 audio:{url:tempFile},
 mimetype:"audio/mpeg",
-fileName:safeFileName(video.title)+".mp3"
+fileName:safeFileName(video.title)+".mp3",
+...channelInfo
 },{quoted:msg});
 
 }catch(err){
@@ -88,7 +94,8 @@ fileName:safeFileName(video.title)+".mp3"
 console.log("PLAY ERROR:",err);
 
 sock.sendMessage(from,{
-text:"❌ Error descargando música"
+text:"❌ Error descargando música",
+...channelInfo
 });
 
 }finally{
