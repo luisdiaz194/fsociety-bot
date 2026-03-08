@@ -1,75 +1,74 @@
 import axios from "axios"
 import yts from "yt-search"
 
-const API = "https://nexevo.onrender.com/ytmp3"
+const API = "https://nexevo.onrender.com/download/y"
 const channelInfo = global.channelInfo || {}
 
 function safeFileName(name){
-return String(name || "audio")
-.replace(/[\\/:*?"<>|]/g,"")
-.slice(0,80)
+  return String(name || "audio")
+    .replace(/[\\/:*?"<>|]/g,"")
+    .slice(0,80)
 }
 
 export default {
+  command:["play","ytmp3"],
+  category:"descarga",
 
-command:["play","ytmp3"],
-category:"descarga",
+  run: async (ctx)=>{
+    const {sock, from, args} = ctx
+    const msg = ctx.m || ctx.msg
 
-run: async (ctx)=>{
+    if(!args.length){
+      return sock.sendMessage(from,{
+        text:"❌ Uso: .play canción\nEjemplo:\n.play ozuna",
+        ...channelInfo
+      })
+    }
 
-const {sock, from, args} = ctx
-const msg = ctx.m || ctx.msg
+    try {
+      // Buscar video en YouTube
+      const query = args.join(" ")
+      const search = await yts(query)
+      const video = search.videos[0]
 
-if(!args.length){
-return sock.sendMessage(from,{
-text:"❌ Uso: .play canción\nEjemplo:\n.play ozuna",
-...channelInfo
-})
-}
+      if(!video){
+        return sock.sendMessage(from,{
+          text:"❌ No encontré resultados",
+          ...channelInfo
+        })
+      }
 
-try{
+      // Mensaje inicial con miniatura
+      await sock.sendMessage(from,{
+        image:{url:video.thumbnail},
+        caption:`🎵 *${video.title}*\n⏱️ ${video.timestamp}\n\n⬇️ Descargando audio...`,
+        ...channelInfo
+      }, {quoted: msg})
 
-const query = args.join(" ")
-const search = await yts(query)
-const video = search.videos[0]
+      // Llamar a API nexevo
+      const {data} = await axios.get(`${API}?url=${encodeURIComponent(video.url)}`)
 
-if(!video){
-return sock.sendMessage(from,{
-text:"❌ No encontré resultados",
-...channelInfo
-})
-}
+      if(!data?.status || !data?.result?.url){
+        throw new Error("API no devolvió audio")
+      }
 
-await sock.sendMessage(from,{
-image:{url:video.thumbnail},
-caption:`🎵 *${video.title}*\n⏱️ ${video.timestamp}\n\n⬇️ Descargando audio...`,
-...channelInfo
-},{quoted:msg})
+      const audioUrl = data.result.url
+      const fileName = safeFileName(video.title)+".mp3"
 
-const {data} = await axios.get(`${API}?url=${encodeURIComponent(video.url)}`)
+      // Enviar audio a WhatsApp
+      await sock.sendMessage(from,{
+        audio:{ url: audioUrl },
+        mimetype:"audio/mpeg",
+        fileName,
+        ...channelInfo
+      }, {quoted: msg})
 
-if(!data || !data.url){
-throw new Error("API sin audio")
-}
-
-await sock.sendMessage(from,{
-audio:{ url: data.url },
-mimetype:"audio/ogg; codecs=opus",
-fileName: safeFileName(video.title)+".ogg",
-...channelInfo
-},{quoted:msg})
-
-}catch(err){
-
-console.log("[PLAY ERROR]", err)
-
-await sock.sendMessage(from,{
-text:"❌ Error descargando música",
-...channelInfo
-})
-
-}
-
-}
-
+    } catch(err){
+      console.log("[PLAY ERROR]", err)
+      await sock.sendMessage(from,{
+        text:"❌ Error descargando música",
+        ...channelInfo
+      })
+    }
+  }
 }
