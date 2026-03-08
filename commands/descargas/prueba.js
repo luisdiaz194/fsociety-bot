@@ -1,7 +1,7 @@
 import axios from "axios";
 import yts from "yt-search";
 
-const API = "https://0f80537128db9987-201-230-121-168.serveousercontent.com/ytmp4";
+const API = "https://0f66da8bd81e5d32-201-230-121-168.serveousercontent.com//ytmp4";
 
 const channelInfo = global.channelInfo || {};
 
