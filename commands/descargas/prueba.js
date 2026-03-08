@@ -6,7 +6,7 @@ const API = "https://0f66da8bd81e5d32-201-230-121-168.serveousercontent.com/ytmp
 const channelInfo = global.channelInfo || {}
 
 function safeFileName(name){
-return String(name||"audio")
+return String(name || "audio")
 .replace(/[\\/:*?"<>|]/g,"")
 .slice(0,80)
 }
@@ -18,7 +18,7 @@ category:"descarga",
 
 run: async(ctx)=>{
 
-const {sock,from,args} = ctx
+const {sock, from, args} = ctx
 const msg = ctx.m || ctx.msg
 
 if(!args.length){
@@ -31,6 +31,7 @@ text:"❌ Uso: .ytmp3yer canción",
 try{
 
 const query = args.join(" ")
+
 const search = await yts(query)
 const video = search.videos[0]
 
@@ -43,37 +44,39 @@ text:"❌ No encontré resultados",
 
 await sock.sendMessage(from,{
 image:{url:video.thumbnail},
-caption:`🎵 Descargando MP3...\n\n${video.title}`,
+caption:`🎵 Descargando audio...\n\n📀 ${video.title}\n⏱ ${video.timestamp}`,
 ...channelInfo
 },{quoted:msg})
 
 const {data} = await axios.get(API,{
-params:{url:video.url},
+params:{
+url: video.url
+},
 timeout:20000
 })
 
-if(!data?.download) throw "sin mp3"
+if(!data) throw "API sin respuesta"
 
-const audio = await axios.get(data.download,{
-responseType:"arraybuffer",
-headers:{
-"User-Agent":"Mozilla/5.0"
+// Detectar link de descarga
+const downloadUrl = data.download || data.url || data.result || data.audio
+
+if(!downloadUrl){
+throw "API no devolvió audio"
 }
-})
 
 await sock.sendMessage(from,{
-audio:audio.data,
-mimetype:"audio/mpeg",
-fileName:safeFileName(video.title)+".mp3",
+audio:{ url: downloadUrl },
+mimetype:"audio/webm",
+fileName: safeFileName(video.title) + ".mp3",
 ...channelInfo
 },{quoted:msg})
 
-}catch(e){
+}catch(err){
 
-console.log("MP3 ERROR:",e)
+console.log("YTMP3 ERROR:",err)
 
 sock.sendMessage(from,{
-text:"❌ Error descargando mp3",
+text:"❌ Error descargando el audio",
 ...channelInfo
 })
 
