@@ -1,13 +1,64 @@
-import axios from "axios";
-import yts from "yt-search";
 import fs from "fs";
 import path from "path";
+import axios from "axios";
+import yts from "yt-search";
 import { exec } from "child_process";
 
-const API_BASE = "https://dv-yer-api.online/ytmp3";
-const TMP_DIR = path.join(process.cwd(), "tmp");
+const API_URL = "https://dv-yer-api.online/ytmp3";
+//const API_KEY = 
 
-if (!fs.existsSync(TMP_DIR)) fs.mkdirSync(TMP_DIR);
+const COOLDOWN_TIME = 10 * 1000;
+const TMP_DIR = path.join(process.cwd(), "tmp");
+const MAX_AUDIO_BYTES = 100 * 1024 * 1024; // 100MB
+
+const cooldowns = new Map();
+
+if (!fs.existsSync(TMP_DIR)) {
+  fs.mkdirSync(TMP_DIR, { recursive: true });
+}
+
+function safeFileName(name) {
+  return String(name || "audio")
+    .replace(/[\\/:*?"<>|]/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 80);
+}
+
+function isHttpUrl(s) {
+  return /^https?:\/\//i.test(String(s || ""));
+}
+
+// Obtener link directo desde la API
+async function fetchDirectMediaUrl({ videoUrl }) {
+  const { data } = await axios.get(API_URL, {
+    timeout: 20000,
+    params: {
+      url: videoUrl,
+      quality: "360p",
+      apikey: API_KEY,
+    },
+  });
+
+  if (!data?.status || !data?.result?.url) {
+    throw new Error("API inválida");
+  }
+
+  return {
+    title: data?.result?.title || "audio",
+    directUrl: data.result.url,
+  };
+}
+
+// Convertir a MP3 con ffmpeg
+async function convertToMp3(inputUrl, outputPath) {
+  return new Promise((resolve, reject) => {
+    exec(
+      `ffmpeg -y -i "${inputUrl}" -vn -ab 128k -ar 44100 -loglevel error "${outputPath}"`,
+      (err) => (err ? reject(err) : resolve())
+    );
+  });
+}
 
 export default {
   command: ["ytmp3", "play"],
@@ -16,63 +67,121 @@ export default {
   run: async (ctx) => {
     const { sock, from, args } = ctx;
     const msg = ctx.m || ctx.msg || null;
-    const messageKey = msg?.key || null;
-    
-    const id = Date.now();
-    const rawPath = path.join(TMP_DIR, `raw_${id}.m4a`);
-    const mp3Path = path.join(TMP_DIR, `final_${id}.mp3`);
+
+    const userId = from;
+    let finalMp3;
+
+    const until = cooldowns.get(userId);
+    if (until && until > Date.now()) {
+      return sock.sendMessage(from, {
+        text: `⏳ Espera ${Math.ceil((until - Date.now()) / 1000)}s`,
+        ...global.channelInfo,
+      });
+    }
+
+    cooldowns.set(userId, Date.now() + COOLDOWN_TIME);
+
+    const quoted = msg?.key ? { quoted: msg } : undefined;
 
     try {
-      if (!args?.length) return;
-      if (messageKey) await sock.sendMessage(from, { react: { text: "⏳", key: messageKey } });
-
-      let query = args.join(" ").trim();
-      let videoUrl = query;
-      if (!/^https?:\/\//i.test(query)) {
-        const { videos } = await yts(query);
-        videoUrl = videos[0].url;
+      if (!args?.length) {
+        cooldowns.delete(userId);
+        return sock.sendMessage(from, {
+          text: "❌ Uso: .play <nombre o link>",
+          text: "❌ Uso: .ytmp3 <nombre o link>",
+          ...global.channelInfo,
+        });
       }
 
-      const apiRes = await axios.get(API_BASE, {
-        params: { mode: "link", quality: "128k", url: videoUrl }
-      });
-      
-      const streamUrl = apiRes.data?.download_url_full;
-      if (!streamUrl) throw new Error("API no respondió.");
+      const query = args.join(" ").trim();
+      let videoUrl = query;
+      let title = "audio";
+      let thumbnail = null;
 
-      // 1. Descargamos el archivo original (M4A)
-      const writer = fs.createWriteStream(rawPath);
-      const response = await axios({ url: streamUrl, method: 'GET', responseType: 'stream' });
-      response.data.pipe(writer);
+      finalMp3 = path.join(TMP_DIR, `${Date.now()}.mp3`);
 
-      await new Promise((resolve, reject) => {
-        writer.on('finish', resolve);
-        writer.on('error', reject);
-      });
+      // Si no es link, buscar en YouTube
+      if (!isHttpUrl(query)) {
+        const search = await yts(query);
+        const first = search?.videos?.[0];
 
-      // 2. CONVERSIÓN FORZADA con FFMPEG a MP3 (Esto limpia el contenedor M4A)
-      await new Promise((resolve, reject) => {
-        const cmd = `ffmpeg -i "${rawPath}" -acodec libmp3lame -ab 128k -ar 44100 -y "${mp3Path}"`;
-        exec(cmd, (err) => err ? reject(err) : resolve());
-      });
+        if (!first) {
+          cooldowns.delete(userId);
+          return sock.sendMessage(from, {
+            text: "❌ No se encontró.",
+            ...global.channelInfo,
+          });
+        }
 
-      // 3. Enviamos el archivo MP3 ya convertido
-      await sock.sendMessage(from, {
-        audio: { url: mp3Path },
-        mimetype: "audio/mpeg",
-        ptt: true,
-        fileName: "audio.mp3"
-      }, { quoted: msg });
+        videoUrl = first.url;
+        title = safeFileName(first.title);
+        thumbnail = first.thumbnail;
+      }
 
-      if (messageKey) await sock.sendMessage(from, { react: { text: "✅", key: messageKey } });
+      // Obtener info desde API
+      const info = await fetchDirectMediaUrl({ videoUrl });
+      title = safeFileName(info.title);
+
+      // Si no hay thumbnail, intentar obtenerla
+      if (!thumbnail) {
+        const search = await yts(videoUrl);
+        const first = search?.videos?.[0];
+        if (first) thumbnail = first.thumbnail;
+      }
+
+      // Mensaje previo
+      await sock.sendMessage(
+        from,
+        {
+          image: thumbnail ? { url: thumbnail } : undefined,
+          caption: `🎵 Descargando música...\n\n🎧 ${title}`,
+          ...global.channelInfo,
+        },
+        quoted
+      );
+
+      // Convertir a mp3
+      await convertToMp3(info.directUrl, finalMp3);
+
+      const size = fs.existsSync(finalMp3)
+        ? fs.statSync(finalMp3).size
+        : 0;
+
+      if (!size || size < 100000) {
+        throw new Error("Audio inválido");
+      }
+
+      if (size > MAX_AUDIO_BYTES) {
+        throw new Error("Audio demasiado grande");
+      }
+
+      // Enviar como audio real
+      await sock.sendMessage(
+        from,
+        {
+          audio: { url: finalMp3 },
+          mimetype: "audio/mpeg",
+          ptt: false,
+          fileName: `${title}.mp3`,
+          ...global.channelInfo,
+        },
+        quoted
+      );
 
     } catch (err) {
-      console.error("❌ ERROR FFMPEG/M4A:", err);
-      if (messageKey) await sock.sendMessage(from, { react: { text: "❌", key: messageKey } });
+      console.error("YTMP3 ERROR:", err?.message || err);
+      cooldowns.delete(userId);
+
+      await sock.sendMessage(from, {
+        text: "❌ Error al procesar la música.",
+        ...global.channelInfo,
+      });
     } finally {
-      // 4. LIMPIEZA: Borramos los archivos temporales
-      if (fs.existsSync(rawPath)) fs.unlinkSync(rawPath);
-      if (fs.existsSync(mp3Path)) fs.unlinkSync(mp3Path);
+      try {
+        if (finalMp3 && fs.existsSync(finalMp3)) {
+          fs.unlinkSync(finalMp3);
+        }
+      } catch {}
     }
   },
 };
