@@ -35,6 +35,10 @@ function normalizeMp4Name(name) {
   return `${clean || "video"}.mp4`;
 }
 
+function stripExtension(name) {
+  return String(name || "").replace(/\.[^.]+$/i, "");
+}
+
 function isHttpUrl(value) {
   return /^https?:\/\//i.test(String(value || ""));
 }
@@ -114,7 +118,7 @@ function parseContentDispositionFileName(headerValue) {
   return "";
 }
 
-async function streamToText(stream) {
+async function readStreamToText(stream) {
   return await new Promise((resolve, reject) => {
     let data = "";
 
@@ -175,7 +179,7 @@ async function downloadVideoFromApi(videoUrl, outputPath) {
   });
 
   if (response.status >= 400) {
-    const errorText = await streamToText(response.data).catch(() => "");
+    const errorText = await readStreamToText(response.data).catch(() => "");
     let parsed = null;
 
     try {
@@ -211,6 +215,7 @@ async function downloadVideoFromApi(videoUrl, outputPath) {
   }
 
   const size = fs.statSync(outputPath).size;
+
   if (!size || size < 150000) {
     throw new Error("Video inválido");
   }
@@ -380,7 +385,6 @@ export default {
       finalVideoFile = path.join(TMP_DIR, `${stamp}-final.mp4`);
 
       const downloaded = await downloadVideoFromApi(videoUrl, rawVideoFile);
-      title = safeFileName(title || "video");
 
       const normalized = await normalizeVideoForWhatsApp(
         downloaded.path,
@@ -392,10 +396,14 @@ export default {
           ? finalVideoFile
           : rawVideoFile;
 
+      const finalTitle = safeFileName(
+        stripExtension(downloaded.fileName || `${title}.mp4`) || title
+      );
+
       await sendVideoFile(sock, from, quoted, {
         filePath: sendPath,
-        fileName: downloaded.fileName || `${title}.mp4`,
-        title,
+        fileName: downloaded.fileName || `${finalTitle}.mp4`,
+        title: finalTitle,
       });
     } catch (err) {
       console.error("YTMP4 ERROR:", err?.message || err);
@@ -420,3 +428,5 @@ export default {
     }
   },
 };
+
+
