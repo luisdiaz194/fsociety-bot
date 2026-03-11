@@ -1,4 +1,7 @@
+import fs from "fs";
+import path from "path";
 import axios from "axios";
+import { spawn } from "child_process";
 
 const API_BASE = "https://dv-yer-api.online";
 const API_AUDIO_URL = `${API_BASE}/ytmp3`;
@@ -6,7 +9,14 @@ const API_SEARCH_URL = `${API_BASE}/ytsearch`;
 
 const COOLDOWN_TIME = 10 * 1000;
 const AUDIO_QUALITY = "128k";
+const TMP_DIR = path.join(process.cwd(), "tmp");
+const MAX_AUDIO_BYTES = 100 * 1024 * 1024;
+
 const cooldowns = new Map();
+
+if (!fs.existsSync(TMP_DIR)) {
+  fs.mkdirSync(TMP_DIR, { recursive: true });
+}
 
 function safeFileName(name) {
   return (
@@ -117,7 +127,7 @@ async function resolveRedirectTarget(url) {
   throw new Error(lastError);
 }
 
-async function requestAudioLink(videoUrl) {
+async function requestAudioSource(videoUrl) {
   let lastError = "No se pudo obtener el audio.";
 
   for (let attempt = 1; attempt <= 3; attempt++) {
@@ -148,18 +158,48 @@ async function requestAudioLink(videoUrl) {
   throw new Error(lastError);
 }
 
-async function sendAudioAsDocument(sock, from, quoted, { directUrl, title }) {
-  await sock.sendMessage(
-    from,
-    {
-      document: { url: directUrl },
-      mimetype: "audio/mp4",
-      fileName: `${title}.m4a`,
-      caption: `🎵 ${title}`,
-      ...global.channelInfo,
-    },
-    quoted
-  );
+async function convertToMp3(inputUrl, outputPath) {
+  return new Promise((resolve, reject) => {
+    const ffmpeg = spawn(
+      "ffmpeg",
+      [
+        "-y",
+        "-i",
+        inputUrl,
+        "-vn",
+        "-c:a",
+        "libmp3lame",
+        "-b:a",
+        "128k",
+        "-ar",
+        "44100",
+        "-loglevel",
+        "error",
+        outputPath,
+      ],
+      {
+        stdio: ["ignore", "ignore", "pipe"],
+      }
+    );
+
+    let errorText = "";
+
+    ffmpeg.stderr.on("data", (chunk) => {
+      errorText += chunk.toString();
+    });
+
+    ffmpeg.on("error", (error) => {
+      reject(error);
+    });
+
+    ffmpeg.on("close", (code) => {
+      if (code === 0) {
+        resolve();
+        return;
+      }
+      reject(new Error(errorText.trim() || `ffmpeg salió con código ${code}`));
+    });
+  });
 }
 
 export default {
@@ -171,6 +211,8 @@ export default {
     const msg = ctx.m || ctx.msg || null;
     const quoted = msg?.key ? { quoted: msg } : undefined;
     const userId = from;
+
+    let finalMp3 = null;
 
     const until = cooldowns.get(userId);
     if (until && until > Date.now()) {
@@ -218,13 +260,33 @@ export default {
         quoted
       );
 
-      const info = await requestAudioLink(videoUrl);
+      const info = await requestAudioSource(videoUrl);
       title = safeFileName(info.title || title);
 
-      await sendAudioAsDocument(sock, from, quoted, {
-        directUrl: info.directUrl,
-        title,
-      });
+      finalMp3 = path.join(TMP_DIR, `${Date.now()}.mp3`);
+      await convertToMp3(info.directUrl, finalMp3);
+
+      const size = fs.existsSync(finalMp3) ? fs.statSync(finalMp3).size : 0;
+
+      if (!size || size < 100000) {
+        throw new Error("Audio inválido");
+      }
+
+      if (size > MAX_AUDIO_BYTES) {
+        throw new Error("Audio demasiado grande");
+      }
+
+      await sock.sendMessage(
+        from,
+        {
+          audio: { url: finalMp3 },
+          mimetype: "audio/mpeg",
+          ptt: false,
+          fileName: `${title}.mp3`,
+          ...global.channelInfo,
+        },
+        quoted
+      );
     } catch (err) {
       console.error("YTMP3 ERROR:", err?.message || err);
       cooldowns.delete(userId);
@@ -233,6 +295,12 @@ export default {
         text: `❌ ${String(err?.message || "Error al procesar la música.")}`,
         ...global.channelInfo,
       });
+    } finally {
+      try {
+        if (finalMp3 && fs.existsSync(finalMp3)) {
+          fs.unlinkSync(finalMp3);
+        }
+      } catch {}
     }
   },
 };
