@@ -231,7 +231,7 @@ async function downloadVideoFromApi(videoUrl, outputPath) {
   return {
     path: outputPath,
     size,
-    fileName: normalizeMp4Name(fromHeader || path.basename(outputPath)),
+    fileName: fromHeader || path.basename(outputPath),
   };
 }
 
@@ -320,7 +320,7 @@ export default {
     const { sock, from } = ctx;
     const msg = ctx.m || ctx.msg || null;
     const quoted = msg?.key ? { quoted: msg } : undefined;
-    const userId = from;
+    const userId = `${from}:video`;
 
     let rawVideoFile = null;
     let finalVideoFile = null;
@@ -402,7 +402,7 @@ export default {
 
       await sendVideoFile(sock, from, quoted, {
         filePath: sendPath,
-        fileName: downloaded.fileName || `${finalTitle}.mp4`,
+        fileName: normalizeMp4Name(downloaded.fileName || `${finalTitle}.mp4`),
         title: finalTitle,
       });
     } catch (err) {
@@ -428,5 +428,6 @@ export default {
     }
   },
 };
+
 
 
