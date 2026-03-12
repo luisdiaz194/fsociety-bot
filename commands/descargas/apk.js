@@ -9,7 +9,7 @@ const API_APK_URL = `${API_BASE}/apkdl`;
 
 const COOLDOWN_TIME = 15 * 1000;
 const REQUEST_TIMEOUT = 120000;
-const MAX_FILE_BYTES = 200 * 1024 * 1024;
+const MAX_FILE_BYTES = 800 * 1024 * 1024;
 const TMP_DIR = path.join(os.tmpdir(), "dvyer-apk");
 
 const cooldowns = new Map();
