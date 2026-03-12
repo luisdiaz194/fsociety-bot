@@ -82,23 +82,29 @@ function extractApiError(data, status) {
   );
 }
 
-function pickDownloadUrl(data) {
-  return (
-    data?.download_url_full ||
-    data?.download_url ||
-    data?.url ||
-    data?.result?.download_url_full ||
-    data?.result?.download_url ||
-    data?.result?.url ||
-    ""
-  );
-}
-
 function mimeFromFileName(fileName) {
   const lower = String(fileName || "").toLowerCase();
   if (lower.endsWith(".apk")) return "application/vnd.android.package-archive";
-  if (lower.endsWith(".xapk")) return "application/zip";
+  if (lower.endsWith(".xapk")) return "application/xapk-package-archive";
   return "application/octet-stream";
+}
+
+function parseContentDispositionFileName(headerValue) {
+  const text = String(headerValue || "");
+  const utfMatch = text.match(/filename\*=UTF-8''([^;]+)/i);
+
+  if (utfMatch?.[1]) {
+    try {
+      return decodeURIComponent(utfMatch[1]).replace(/["']/g, "").trim();
+    } catch {}
+  }
+
+  const normalMatch = text.match(/filename="?([^"]+)"?/i);
+  if (normalMatch?.[1]) {
+    return normalMatch[1].trim();
+  }
+
+  return "";
 }
 
 function deleteFileSafe(filePath) {
@@ -135,18 +141,10 @@ async function requestApkInfo(input) {
     prefer: "auto",
   };
 
-  if (isApkPureUrl(input)) {
-    params.url = input;
-  } else {
-    params.q = input;
-  }
+  if (isApkPureUrl(input)) params.url = input;
+  else params.q = input;
 
   const data = await apiGet(API_APK_URL, params, REQUEST_TIMEOUT);
-
-  const downloadUrl = pickDownloadUrl(data);
-  if (!downloadUrl) {
-    throw new Error("La API no devolvió download_url.");
-  }
 
   return {
     title: safeFileName(data?.title || data?.package_name || "app"),
@@ -155,18 +153,22 @@ async function requestApkInfo(input) {
     version: data?.version || null,
     format: String(data?.format || "").toLowerCase() || null,
     icon: data?.icon || null,
-    downloadUrl,
   };
 }
 
-async function downloadApkToTemp(downloadUrl, fileName) {
-  const safeName = safeFileName(fileName || "app.apk");
-  const tempPath = path.join(TMP_DIR, `${Date.now()}-${safeName}`);
+async function downloadApkFromApi(input, outputPath) {
+  const params = {
+    mode: "file",
+    prefer: "auto",
+  };
 
-  const response = await axios.get(downloadUrl, {
+  if (isApkPureUrl(input)) params.url = input;
+  else params.q = input;
+
+  const response = await axios.get(API_APK_URL, {
     responseType: "stream",
     timeout: REQUEST_TIMEOUT,
-    maxRedirects: 5,
+    params,
     headers: {
       "User-Agent":
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122 Safari/537.36",
@@ -174,6 +176,7 @@ async function downloadApkToTemp(downloadUrl, fileName) {
       Referer: `${API_BASE}/`,
     },
     validateStatus: () => true,
+    maxRedirects: 5,
   });
 
   if (response.status >= 400) {
@@ -195,33 +198,35 @@ async function downloadApkToTemp(downloadUrl, fileName) {
   });
 
   try {
-    await pipeline(response.data, fs.createWriteStream(tempPath));
+    await pipeline(response.data, fs.createWriteStream(outputPath));
   } catch (error) {
-    deleteFileSafe(tempPath);
+    deleteFileSafe(outputPath);
     throw error;
   }
 
-  if (!fs.existsSync(tempPath)) {
+  if (!fs.existsSync(outputPath)) {
     throw new Error("No se pudo guardar el archivo.");
   }
 
-  const size = fs.statSync(tempPath).size;
-
+  const size = fs.statSync(outputPath).size;
   if (!size || size < 50000) {
-    deleteFileSafe(tempPath);
+    deleteFileSafe(outputPath);
     throw new Error("El archivo descargado es inválido.");
   }
 
   if (size > MAX_FILE_BYTES) {
-    deleteFileSafe(tempPath);
+    deleteFileSafe(outputPath);
     throw new Error("El archivo es demasiado grande para enviarlo por WhatsApp.");
   }
 
+  const contentDisposition = response.headers?.["content-disposition"];
+  const detectedName = parseContentDispositionFileName(contentDisposition) || path.basename(outputPath);
+
   return {
-    tempPath,
+    tempPath: outputPath,
     size,
-    fileName: safeName,
-    mime: mimeFromFileName(safeName),
+    fileName: safeFileName(detectedName),
+    mime: mimeFromFileName(detectedName),
   };
 }
 
@@ -299,8 +304,8 @@ export default {
         );
       }
 
-      const downloaded = await downloadApkToTemp(info.downloadUrl, info.fileName);
-      tempPath = downloaded.tempPath;
+      tempPath = path.join(TMP_DIR, `${Date.now()}-${safeFileName(info.fileName || "app.apk")}`);
+      const downloaded = await downloadApkFromApi(userInput, tempPath);
 
       await sendApkDocument(sock, from, quoted, {
         filePath: downloaded.tempPath,
