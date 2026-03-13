@@ -315,12 +315,7 @@ function buildBotConfigs(currentSettings) {
     label: "MAIN",
     displayName: String(currentSettings?.botName || "DVYER").trim() || "DVYER",
     authFolder: mainAuthFolder,
-    pairingNumber:
-      sanitizePhoneNumber(currentSettings?.pairingNumber) ||
-      sanitizePhoneNumber(currentSettings?.botNumber) ||
-      sanitizePhoneNumber(currentSettings?.ownerNumber) ||
-      sanitizePhoneNumber(currentSettings?.ownerNumbers?.[0]) ||
-      "",
+    pairingNumber: sanitizePhoneNumber(currentSettings?.pairingNumber) || "",
   });
 
   if (currentSettings?.subbot?.enabled) {
@@ -919,7 +914,7 @@ async function requestPairingCode(botState, options = {}) {
     return {
       ok: false,
       status: "missing_number",
-      message: `Usa ${
+      message: `Primero vincula el bot principal por consola y luego usa ${
         Array.isArray(settings.prefix) ? settings.prefix[0] || "." : settings.prefix || "."
       }subbot 519xxxxxxxxx para pedir el codigo.`,
     };
