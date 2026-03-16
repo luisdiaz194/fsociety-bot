@@ -1,6 +1,9 @@
+import fs from "fs";
+import path from "path";
 import { spawn } from "child_process";
 
 const RESTART_DELAY_MS = 3000;
+const PROTECTED_LOCAL_PATHS = new Set(["settings/settings.json"]);
 let updateInProgress = false;
 
 function delay(ms) {
@@ -101,6 +104,20 @@ function pickMainLine(result) {
 
 function normalizeGitPath(value = "") {
   return String(value || "").replace(/\\/g, "/").trim();
+}
+
+function uniquePaths(values = []) {
+  return Array.from(
+    new Set(
+      (Array.isArray(values) ? values : [])
+        .map((value) => normalizeGitPath(value))
+        .filter(Boolean)
+    )
+  );
+}
+
+function isProtectedLocalPath(filePath = "") {
+  return PROTECTED_LOCAL_PATHS.has(normalizeGitPath(filePath));
 }
 
 function extractGitStatusPath(line = "") {
@@ -287,39 +304,148 @@ async function getRepoStatus(settings) {
   };
 }
 
-async function stashWorkspaceIfNeeded(reason = "update") {
+async function getMergeConflictPaths() {
+  try {
+    const result = await runCommand("git", ["diff", "--name-only", "--diff-filter=U"]);
+    return uniquePaths(toLines(result.stdout));
+  } catch {
+    return [];
+  }
+}
+
+function backupProtectedLocalFiles(filePaths = []) {
+  const backups = new Map();
+
+  for (const filePath of uniquePaths(filePaths)) {
+    if (!isProtectedLocalPath(filePath)) continue;
+
+    const absolutePath = path.join(process.cwd(), filePath.split("/").join(path.sep));
+    if (!fs.existsSync(absolutePath)) {
+      backups.set(filePath, { exists: false, content: "" });
+      continue;
+    }
+
+    backups.set(filePath, {
+      exists: true,
+      content: fs.readFileSync(absolutePath, "utf-8"),
+    });
+  }
+
+  return backups;
+}
+
+function restoreProtectedLocalFiles(backups = new Map()) {
+  let restored = 0;
+
+  for (const [filePath, snapshot] of backups.entries()) {
+    if (!snapshot?.exists) continue;
+
+    const absolutePath = path.join(process.cwd(), filePath.split("/").join(path.sep));
+    fs.mkdirSync(path.dirname(absolutePath), { recursive: true });
+    fs.writeFileSync(absolutePath, String(snapshot.content || ""));
+    restored += 1;
+  }
+
+  return restored;
+}
+
+async function findStashRefByLabel(label) {
+  if (!label) return "";
+
+  const stashList = await runCommand("git", ["stash", "list"]);
+  const stashLine = toLines(stashList.stdout).find((line) => line.includes(label));
+  if (!stashLine) return "";
+
+  return stashLine.split(":")[0].trim();
+}
+
+async function getStashPaths(stashRef) {
+  if (!stashRef) return [];
+
+  try {
+    const result = await runCommand("git", [
+      "stash",
+      "show",
+      "--name-only",
+      "--include-untracked",
+      stashRef,
+    ]);
+    return uniquePaths(toLines(result.stdout));
+  } catch {
+    return [];
+  }
+}
+
+async function dropStashRef(stashRef) {
+  if (!stashRef) return false;
+  await runCommand("git", ["stash", "drop", stashRef]);
+  return true;
+}
+
+async function stashWorkspaceIfNeeded(reason = "update", filePaths = []) {
   const label = `bot-update-${reason}-${Date.now()}`;
-  const result = await runCommand("git", [
+  const normalizedPaths = uniquePaths(filePaths);
+  const args = [
     "stash",
     "push",
     "--include-untracked",
     "-m",
     label,
-  ]);
+  ];
+
+  if (normalizedPaths.length) {
+    args.push("--", ...normalizedPaths);
+  }
+
+  const result = await runCommand("git", args);
   const created = !/No local changes to save/i.test(result.stdout || "");
 
   return {
     label,
     created,
     result,
+    filePaths: normalizedPaths,
   };
 }
 
-async function restoreWorkspaceFromStash(label) {
+async function restoreWorkspaceFromStash(label, options = {}) {
   if (!label) return { restored: false };
 
-  const stashList = await runCommand("git", ["stash", "list"]);
-  const stashLine = toLines(stashList.stdout).find((line) => line.includes(label));
-  if (!stashLine) {
+  const stashRef = await findStashRefByLabel(label);
+  if (!stashRef) {
     return { restored: false };
   }
 
-  const stashRef = stashLine.split(":")[0].trim();
+  const filePaths = uniquePaths(
+    options.filePaths?.length ? options.filePaths : await getStashPaths(stashRef)
+  );
+  const nonProtectedPaths = filePaths.filter((filePath) => !isProtectedLocalPath(filePath));
+  const protectedBackups = options.protectedBackups instanceof Map
+    ? options.protectedBackups
+    : new Map();
+
+  if (!nonProtectedPaths.length && protectedBackups.size) {
+    const restoredFiles = restoreProtectedLocalFiles(protectedBackups);
+    await dropStashRef(stashRef);
+
+    return {
+      restored: restoredFiles > 0,
+      stashRef,
+      mode: "protected-backup-only",
+      restoredFiles,
+    };
+  }
+
   await runCommand("git", ["stash", "pop", stashRef]);
+
+  if (protectedBackups.size) {
+    restoreProtectedLocalFiles(protectedBackups);
+  }
 
   return {
     restored: true,
     stashRef,
+    mode: "stash-pop",
   };
 }
 
@@ -418,10 +544,30 @@ export default {
     let stashLabel = "";
     let stashCreated = false;
     let stashRestored = false;
+    let stashPaths = [];
+    let protectedBackups = new Map();
 
     try {
       const forceRestart = ["force", "restart", "reboot"].includes(subcommand);
       const restartMode = getRestartMode();
+      const mergeConflicts = await getMergeConflictPaths();
+
+      if (mergeConflicts.length) {
+        await sock.sendMessage(
+          from,
+          {
+            text:
+              "*UPDATE BLOQUEADO*\n\n" +
+              "Tu repo ya tiene archivos en conflicto.\n" +
+              `Conflictos: *${mergeConflicts.join(", ")}*\n\n` +
+              "Primero resuelve ese merge y luego vuelve a usar .update.",
+            ...global.channelInfo,
+          },
+          quoted
+        );
+        updateInProgress = false;
+        return;
+      }
 
       await sock.sendMessage(
         from,
@@ -437,7 +583,9 @@ export default {
 
       const status = await getRepoStatus(settings);
       if (status.blockingLines.length) {
-        const stash = await stashWorkspaceIfNeeded("workspace");
+        stashPaths = uniquePaths(status.blockingLines.map((line) => extractGitStatusPath(line)));
+        protectedBackups = backupProtectedLocalFiles(stashPaths);
+        const stash = await stashWorkspaceIfNeeded("workspace", stashPaths);
         stashLabel = stash.label;
         stashCreated = stash.created;
       }
@@ -493,7 +641,10 @@ export default {
       }
 
       if (stashCreated) {
-        await restoreWorkspaceFromStash(stashLabel);
+        await restoreWorkspaceFromStash(stashLabel, {
+          filePaths: stashPaths,
+          protectedBackups,
+        });
         stashRestored = true;
       }
 
@@ -525,7 +676,9 @@ export default {
         ? "Dependencias: *actualizadas*"
         : "Dependencias: *sin cambios*";
       const stashSummary = stashCreated
-        ? "Cambios locales: *guardados y restaurados*"
+        ? protectedBackups.size
+          ? "Cambios locales: *guardados y config local conservada*"
+          : "Cambios locales: *guardados y restaurados*"
         : "Cambios locales: *limpio*";
 
       await sock.sendMessage(
@@ -552,7 +705,10 @@ export default {
     } catch (error) {
       if (stashCreated && !stashRestored && stashLabel) {
         try {
-          await restoreWorkspaceFromStash(stashLabel);
+          await restoreWorkspaceFromStash(stashLabel, {
+            filePaths: stashPaths,
+            protectedBackups,
+          });
           stashRestored = true;
         } catch {}
       }
