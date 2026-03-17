@@ -3,12 +3,18 @@ import path from "path";
 import axios from "axios";
 import { pipeline } from "stream/promises";
 import { spawn } from "child_process";
+import { buildDvyerUrl, getDvyerBaseUrl } from "../../lib/api-manager.js";
+import { getDownloadCache, setDownloadCache, withInflightDedup } from "../../lib/download-cache.js";
 
-const API_BASE = "https://dv-yer-api.online";
-const API_VIDEO_URL = `${API_BASE}/ytdlmp4`;
-const API_VIDEO_LEGACY_URL = `${API_BASE}/ytmp4`;
-const API_VIDEO_ALT_URL = `${API_BASE}/ytaltmp4`;
-const API_SEARCH_URL = `${API_BASE}/ytsearch`;
+const API_VIDEO_PATH = "/ytdlmp4";
+const API_VIDEO_LEGACY_PATH = "/ytmp4";
+const API_VIDEO_ALT_PATH = "/ytaltmp4";
+const API_SEARCH_PATH = "/ytsearch";
+const API_BASE = getDvyerBaseUrl();
+const API_VIDEO_URL = buildDvyerUrl(API_VIDEO_PATH);
+const API_VIDEO_LEGACY_URL = buildDvyerUrl(API_VIDEO_LEGACY_PATH);
+const API_VIDEO_ALT_URL = buildDvyerUrl(API_VIDEO_ALT_PATH);
+const API_SEARCH_URL = buildDvyerUrl(API_SEARCH_PATH);
 
 const COOLDOWN_TIME = 15 * 1000;
 const VIDEO_QUALITY = "360p";
@@ -238,6 +244,30 @@ async function resolveFastestVideoLink(videoUrl) {
         "No se pudo obtener un enlace de descarga desde las rutas internas."
     );
   }
+}
+
+async function resolveSearchCached(query) {
+  const cacheKey = `ytsearch:${String(query || "").trim().toLowerCase()}`;
+  const cached = getDownloadCache(cacheKey);
+  if (cached?.videoUrl) return cached;
+
+  return withInflightDedup(cacheKey, async () => {
+    const result = await resolveSearch(query);
+    setDownloadCache(cacheKey, result);
+    return result;
+  });
+}
+
+async function resolveFastestVideoLinkCached(videoUrl) {
+  const cacheKey = `ytdlmp4:${String(videoUrl || "").trim()}`;
+  const cached = getDownloadCache(cacheKey);
+  if (cached?.downloadUrl) return cached;
+
+  return withInflightDedup(cacheKey, async () => {
+    const result = await resolveFastestVideoLink(videoUrl);
+    setDownloadCache(cacheKey, result);
+    return result;
+  });
 }
 
 async function downloadVideoFromInternalLink(downloadUrl, outputPath, suggestedFileName = "video.mp4") {
@@ -509,7 +539,7 @@ export default {
           });
         }
 
-        const search = await resolveSearch(rawInput);
+        const search = await resolveSearchCached(rawInput);
         videoUrl = search.videoUrl;
         title = search.title;
         thumbnail = search.thumbnail;
@@ -537,7 +567,7 @@ export default {
       let downloaded = null;
 
       try {
-        const fastestLink = await resolveFastestVideoLink(videoUrl);
+        const fastestLink = await resolveFastestVideoLinkCached(videoUrl);
         title = safeFileName(fastestLink.title || title || "video");
 
         console.log(

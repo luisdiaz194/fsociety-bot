@@ -18,7 +18,7 @@ export default {
             ? leaderboard
                 .map(
                   (entry, index) =>
-                    `${index + 1}. ${formatUserLabel(entry.id)} - *${formatCoins(entry.coins)}*`
+                    `${index + 1}. ${formatUserLabel(entry.id)} - *${formatCoins(entry.total)}*`
                 )
                 .join("\n")
             : "Todavia no hay jugadores con coins."}`,

@@ -8,8 +8,28 @@ import chalk from "chalk";
 import readline from "readline";
 import fs from "fs";
 import path from "path";
+import http from "http";
 import { spawn } from "child_process";
 import { fileURLToPath, pathToFileURL } from "url";
+import {
+  recordWeeklyCommand,
+  recordWeeklyMessage,
+  getWeeklySnapshot,
+} from "./lib/weekly.js";
+import {
+  recordCommandFailure,
+  recordCommandSuccess,
+  isCommandTemporarilyBlocked,
+  getResilienceSnapshot,
+  setResilienceConfig,
+  clearResilienceCommand,
+} from "./lib/resilience.js";
+import {
+  runAutoClean,
+  getAutoCleanState,
+  setAutoCleanConfig,
+} from "./lib/autoclean.js";
+import { applyStoredRuntimeVars } from "./lib/runtime-vars.js";
 
 const makeWASocket =
   (typeof baileys.makeWASocket === "function" && baileys.makeWASocket) ||
@@ -43,6 +63,8 @@ const BOT_RUNTIME_STATE_TTL_MS = 20_000;
 const REMOTE_PAIRING_WAIT_MS = 18_000;
 const logger = pino({ level: "silent" });
 const FIXED_BROWSER = ["Windows", "Chrome", "114.0.5735.198"];
+
+applyStoredRuntimeVars();
 
 const settings = JSON.parse(
   fs.readFileSync("./settings/settings.json", "utf-8")
@@ -979,6 +1001,13 @@ function normalizeUsageStats(data = {}) {
 const usageStats = normalizeUsageStats(safeReadJson(USAGE_STATS_FILE, {}));
 let usageStatsSaveTimer = null;
 let managedBotSyncInterval = null;
+let autoCleanInterval = null;
+let dashboardServer = null;
+let dashboardState = {
+  enabled: false,
+  port: 8787,
+  host: "0.0.0.0",
+};
 
 function scheduleUsageStatsSave() {
   if (usageStatsSaveTimer) return;
@@ -1025,6 +1054,10 @@ function trackMessageUsage(botState, message) {
     messages: 1,
     commands: 0,
   });
+  recordWeeklyMessage({
+    userId: senderId,
+    chatId,
+  });
   scheduleUsageStatsSave();
 }
 
@@ -1040,6 +1073,11 @@ function trackCommandUsage(botState, message, commandName) {
   incrementUsageCounter(usageStats.chatUsage, chatId, { commands: 1 });
   incrementUsageCounter(usageStats.userUsage, senderId, { commands: 1 });
   incrementUsageCounter(usageStats.botUsage, botId, { commands: 1 });
+  recordWeeklyCommand({
+    userId: senderId,
+    chatId,
+    commandName: normalizedCommand,
+  });
   scheduleUsageStatsSave();
 }
 
@@ -1516,6 +1554,18 @@ async function runMessageDeleteHooks(botState, sock, payload) {
 async function canRunCommand(cmd, context) {
   const quoted = getQuoteOptions(context.msg);
 
+  if (cmd?.ownerOnly && !context.esOwner) {
+    await context.sock.sendMessage(
+      context.from,
+      {
+        text: "Solo el owner puede usar este comando.",
+        ...global.channelInfo,
+      },
+      quoted
+    );
+    return false;
+  }
+
   if (cmd?.groupOnly && !context.esGrupo) {
     await context.sock.sendMessage(
       context.from,
@@ -1545,6 +1595,27 @@ async function canRunCommand(cmd, context) {
       context.from,
       {
         text: "Necesito ser administrador para usar este comando.",
+        ...global.channelInfo,
+      },
+      quoted
+    );
+    return false;
+  }
+
+  const disabledState = isCommandTemporarilyBlocked(context.commandName || cmd?.name || "");
+  if (disabledState.blocked && !context.esOwner) {
+    let text =
+      "Ese comando fue pausado automaticamente por errores repetidos.\n" +
+      `Tiempo restante: ${Math.ceil(disabledState.remainingMs / 1000)}s`;
+
+    if (disabledState.lastError) {
+      text += `\nUltimo error: ${disabledState.lastError}`;
+    }
+
+    await context.sock.sendMessage(
+      context.from,
+      {
+        text,
         ...global.channelInfo,
       },
       quoted
@@ -1788,6 +1859,107 @@ function scheduleReconnect(botState, ms = 2500) {
     botState.reconnectTimer = null;
     iniciarInstanciaBot(botState.config);
   }, ms);
+}
+
+function getDashboardSnapshot() {
+  return {
+    pid: process.pid,
+    uptimeSeconds: Math.floor(process.uptime()),
+    processMode: PROCESS_MODE_LABEL,
+    commandsLoaded: comandos.size,
+    totalMessages,
+    totalCommands,
+    memory: process.memoryUsage(),
+    bots: global.botRuntime?.listBots?.({ includeMain: true }) || [],
+    usage: getUsageStatsSnapshot(10),
+    weekly: getWeeklySnapshot(10),
+    resilience: getResilienceSnapshot(),
+    autoclean: getAutoCleanState(),
+    dashboard: {
+      ...dashboardState,
+      active: Boolean(dashboardServer),
+    },
+  };
+}
+
+function ensureDashboardServer() {
+  if (!dashboardState.enabled || dashboardServer) return;
+
+  dashboardServer = http.createServer((req, res) => {
+    const url = String(req?.url || "/");
+
+    if (url.startsWith("/json")) {
+      const payload = JSON.stringify(getDashboardSnapshot(), null, 2);
+      res.writeHead(200, {
+        "content-type": "application/json; charset=utf-8",
+      });
+      res.end(payload);
+      return;
+    }
+
+    const snapshot = getDashboardSnapshot();
+    const html = `
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <title>DVYER Dashboard</title>
+  <style>
+    body { font-family: Consolas, monospace; background: #10151f; color: #e8f0ff; margin: 0; padding: 24px; }
+    h1 { margin-top: 0; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 16px; }
+    .card { background: #172232; border: 1px solid #25354c; border-radius: 14px; padding: 16px; }
+    pre { white-space: pre-wrap; word-break: break-word; }
+  </style>
+</head>
+<body>
+  <h1>DVYER Dashboard</h1>
+  <div class="grid">
+    <div class="card"><b>PID</b><br>${snapshot.pid}</div>
+    <div class="card"><b>Uptime</b><br>${snapshot.uptimeSeconds}s</div>
+    <div class="card"><b>Modo</b><br>${snapshot.processMode}</div>
+    <div class="card"><b>Comandos</b><br>${snapshot.commandsLoaded}</div>
+  </div>
+  <div class="card" style="margin-top:16px"><pre>${JSON.stringify(snapshot, null, 2)}</pre></div>
+</body>
+</html>`;
+    res.writeHead(200, {
+      "content-type": "text/html; charset=utf-8",
+    });
+    res.end(html);
+  });
+
+  dashboardServer.listen(dashboardState.port, dashboardState.host, () => {
+    console.log(`Dashboard web activo en http://${dashboardState.host}:${dashboardState.port}`);
+  });
+}
+
+function setDashboardConfig(patch = {}) {
+  if (Object.prototype.hasOwnProperty.call(patch, "enabled")) {
+    dashboardState.enabled = Boolean(patch.enabled);
+  }
+  if (Object.prototype.hasOwnProperty.call(patch, "port")) {
+    const nextPort = Number(patch.port || dashboardState.port);
+    if (Number.isFinite(nextPort) && nextPort >= 1 && nextPort <= 65535) {
+      dashboardState.port = nextPort;
+    }
+  }
+  if (Object.prototype.hasOwnProperty.call(patch, "host")) {
+    dashboardState.host = String(patch.host || dashboardState.host || "0.0.0.0").trim() || "0.0.0.0";
+  }
+
+  if (dashboardServer) {
+    try {
+      dashboardServer.close();
+    } catch {}
+    dashboardServer = null;
+  }
+
+  ensureDashboardServer();
+  return {
+    ...dashboardState,
+    active: Boolean(dashboardServer),
+  };
 }
 
 // ================= BANNER =================
@@ -2725,8 +2897,18 @@ global.botRuntime = {
     global.consoleBuffer.slice(-Math.max(1, Math.min(80, Number(limit || 25)))),
   getUsageStats: (limit = 5) =>
     getUsageStatsSnapshot(Math.max(1, Math.min(15, Number(limit || 5)))),
+  getWeeklyStats: (limit = 5) =>
+    getWeeklySnapshot(Math.max(1, Math.min(15, Number(limit || 5)))),
   getMaintenanceState: () => getMaintenanceState(),
   setMaintenanceState: (mode, message = "") => setMaintenanceState(mode, message),
+  getResilienceState: () => getResilienceSnapshot(),
+  setResilienceConfig: (patch = {}) => setResilienceConfig(patch),
+  clearResilienceCommand: (commandName) => clearResilienceCommand(commandName),
+  getAutoCleanState: () => getAutoCleanState(),
+  setAutoCleanConfig: (patch = {}) => setAutoCleanConfig(patch),
+  runAutoClean: () => runAutoClean(),
+  getDashboardSnapshot: () => getDashboardSnapshot(),
+  setDashboardConfig: (patch = {}) => setDashboardConfig(patch),
   listBots: (options = {}) => {
     const includeMain = options?.includeMain === true;
     const onlyConnected = options?.onlyConnected === true;
@@ -2797,6 +2979,8 @@ global.botRuntime = {
 
 async function handleIncomingMessages(botState, sock, messages) {
   for (const raw of messages || []) {
+    let failedCommandName = "";
+
     try {
       if (!raw?.message) continue;
       if (raw?.key?.fromMe) continue;
@@ -2822,6 +3006,7 @@ async function handleIncomingMessages(botState, sock, messages) {
 
       const commandData = extractCommandData(texto, settings);
       if (!commandData) continue;
+      failedCommandName = commandData.commandName;
 
       const cmd = comandos.get(commandData.commandName);
       if (!cmd) continue;
@@ -2844,14 +3029,22 @@ async function handleIncomingMessages(botState, sock, messages) {
 
       if (isDownloadCommand(cmd)) {
         const runningJob = enqueueDownloadCommand(botState, cmd, commandContext);
+        runningJob.promise.then(() => {
+          recordCommandSuccess(commandData.commandName);
+        });
         runningJob.promise.catch((err) => {
+          recordCommandFailure(commandData.commandName, err);
           console.error(`${getBotTag(botState)} Error comando concurrente:`, err);
         });
         continue;
       }
 
       await cmd.run(commandContext);
+      recordCommandSuccess(commandData.commandName);
     } catch (err) {
+      if (failedCommandName) {
+        recordCommandFailure(failedCommandName, err);
+      }
       console.error(`${getBotTag(botState)} Error comando:`, err);
     }
   }
@@ -3063,6 +3256,8 @@ async function start() {
   await syncManagedProcessBots();
   await syncSplitSubbotProcessPool();
   flushManagedBotRuntimeStates();
+  ensureDashboardServer();
+  runAutoClean();
 
   if (!managedBotSyncInterval) {
     managedBotSyncInterval = setInterval(() => {
@@ -3074,6 +3269,20 @@ async function start() {
       });
     }, SETTINGS_SYNC_INTERVAL_MS);
     managedBotSyncInterval.unref?.();
+  }
+
+  if (!autoCleanInterval) {
+    autoCleanInterval = setInterval(() => {
+      try {
+        const state = getAutoCleanState();
+        if (state.enabled) {
+          runAutoClean();
+        }
+      } catch (err) {
+        console.error("Error en autoclean:", err);
+      }
+    }, Math.max(60_000, Number(getAutoCleanState().intervalMs || 30 * 60 * 1000)));
+    autoCleanInterval.unref?.();
   }
 }
 
@@ -3088,6 +3297,10 @@ process.on("SIGINT", () => {
     if (managedBotSyncInterval) {
       clearInterval(managedBotSyncInterval);
       managedBotSyncInterval = null;
+    }
+    if (autoCleanInterval) {
+      clearInterval(autoCleanInterval);
+      autoCleanInterval = null;
     }
     fs.writeFileSync(USAGE_STATS_FILE, JSON.stringify(usageStats, null, 2));
   } catch {}

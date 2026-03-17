@@ -23,6 +23,8 @@ export default {
         text:
           `*ECONOMIA DE ${formatUserLabel(sender)}*\n\n` +
           `Coins: *${formatCoins(profile?.coins || 0)}*\n` +
+          `Banco: *${formatCoins(profile?.bank || 0)}*\n` +
+          `Total actual: *${formatCoins(Number(profile?.coins || 0) + Number(profile?.bank || 0))}*\n` +
           `Ganado total: *${formatCoins(profile?.totalEarned || 0)}*\n` +
           `Gastado total: *${formatCoins(profile?.totalSpent || 0)}*\n\n` +
           `Inventario:\n${inventoryLines.length ? inventoryLines.join("\n") : "- Vacio"}`,

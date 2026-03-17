@@ -3,11 +3,12 @@ import path from "path";
 
 const VIP_FILE = path.join(process.cwd(), "settings", "vip.json");
 
-// ================== HELPERS ==================
 function ensureVipFile() {
   const dir = path.dirname(VIP_FILE);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-  if (!fs.existsSync(VIP_FILE)) fs.writeFileSync(VIP_FILE, JSON.stringify({ users: {} }, null, 2));
+  if (!fs.existsSync(VIP_FILE)) {
+    fs.writeFileSync(VIP_FILE, JSON.stringify({ users: {} }, null, 2));
+  }
 }
 
 function readVip() {
@@ -15,8 +16,9 @@ function readVip() {
   try {
     const raw = fs.readFileSync(VIP_FILE, "utf-8");
     const data = JSON.parse(raw);
-    if (!data.users || typeof data.users !== "object") data.users = {};
-    return data;
+    return {
+      users: data?.users && typeof data.users === "object" ? data.users : {},
+    };
   } catch {
     return { users: {} };
   }
@@ -27,184 +29,261 @@ function saveVip(data) {
   fs.writeFileSync(VIP_FILE, JSON.stringify(data, null, 2));
 }
 
-function normId(x) {
-  // Para números y LID: deja solo dígitos
-  return String(x || "")
+function normalizeNumber(value = "") {
+  return String(value || "")
     .split("@")[0]
     .split(":")[0]
     .replace(/[^\d]/g, "")
     .trim();
 }
 
-function getSenderJid(msg, from) {
-  return msg?.key?.participant || msg?.participant || msg?.key?.remoteJid || from;
+function parseDurationToMs(value = "") {
+  const match = String(value || "")
+    .trim()
+    .toLowerCase()
+    .match(/^(\d+)(s|m|h|d)$/);
+
+  if (!match) return 0;
+
+  const amount = Number(match[1] || 0);
+  const unit = match[2];
+  const multiplier =
+    unit === "s" ? 1000 : unit === "m" ? 60_000 : unit === "h" ? 3_600_000 : 86_400_000;
+
+  return amount * multiplier;
 }
 
-function getSenderId(msg, from) {
-  return normId(getSenderJid(msg, from));
+function formatDuration(ms = 0) {
+  const total = Math.max(0, Math.floor(Number(ms || 0) / 1000));
+  const days = Math.floor(total / 86400);
+  const hours = Math.floor((total % 86400) / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const seconds = total % 60;
+
+  if (days > 0) return `${days}d ${hours}h`;
+  if (hours > 0) return `${hours}h ${minutes}m`;
+  if (minutes > 0) return `${minutes}m ${seconds}s`;
+  return `${seconds}s`;
 }
 
-function getOwnersIds(settings) {
-  const ids = [];
-
-  // ownerNumbers
-  if (Array.isArray(settings?.ownerNumbers)) ids.push(...settings.ownerNumbers);
-  if (typeof settings?.ownerNumber === "string") ids.push(settings.ownerNumber);
-
-  // ✅ NUEVO: ownerLids (para @lid)
-  if (Array.isArray(settings?.ownerLids)) ids.push(...settings.ownerLids);
-  if (typeof settings?.ownerLid === "string") ids.push(settings.ownerLid);
-
-  // opcional
-  if (typeof settings?.botNumber === "string") ids.push(settings.botNumber);
-
-  return ids.map(normId).filter(Boolean);
-}
-
-function esOwner(msg, from, settings) {
-  const senderId = getSenderId(msg, from);
-  const owners = getOwnersIds(settings);
-  return owners.includes(senderId);
-}
-
-// 7d / 12h / 30m / 20s
-function parseDurationToMs(str) {
-  const s = String(str || "").trim().toLowerCase();
-  const m = s.match(/^(\d+)(s|m|h|d)$/);
-  if (!m) return null;
-  const n = parseInt(m[1], 10);
-  const unit = m[2];
-  const mult =
-    unit === "s" ? 1000 :
-    unit === "m" ? 60_000 :
-    unit === "h" ? 3_600_000 :
-    86_400_000;
-  return n * mult;
-}
-
-function fmtMs(ms) {
-  const sec = Math.max(0, Math.floor(ms / 1000));
-  const d = Math.floor(sec / 86400);
-  const h = Math.floor((sec % 86400) / 3600);
-  const m = Math.floor((sec % 3600) / 60);
-  const s = sec % 60;
-
-  if (d > 0) return `${d}d ${h}h`;
-  if (h > 0) return `${h}h ${m}m`;
-  if (m > 0) return `${m}m ${s}s`;
-  return `${s}s`;
-}
-
-function limpiar(data) {
+function cleanupVip(data) {
   const now = Date.now();
-  for (const [num, info] of Object.entries(data.users || {})) {
-    if (!info) delete data.users[num];
-    else if (typeof info.expiresAt === "number" && now >= info.expiresAt) delete data.users[num];
-    else if (typeof info.usesLeft === "number" && info.usesLeft <= 0) delete data.users[num];
+  for (const [number, info] of Object.entries(data.users || {})) {
+    if (!info || typeof info !== "object") {
+      delete data.users[number];
+      continue;
+    }
+
+    if (Number.isFinite(Number(info.expiresAt)) && Number(info.expiresAt) <= now) {
+      delete data.users[number];
+      continue;
+    }
+
+    if (Number.isFinite(Number(info.usesLeft)) && Number(info.usesLeft) <= 0) {
+      delete data.users[number];
+    }
   }
 }
 
-// ================== COMMAND ==================
+function getPrefix(settings) {
+  if (Array.isArray(settings?.prefix)) {
+    return settings.prefix.find((value) => String(value || "").trim()) || ".";
+  }
+  return String(settings?.prefix || ".").trim() || ".";
+}
+
 export default {
   name: "vip",
   command: ["vip"],
   category: "admin",
-  description: "Administra VIP (solo owner) con vencimiento y usos",
+  description: "Administra usuarios VIP con tiempo, usos y panel mejorado",
+  ownerOnly: true,
 
   run: async ({ sock, msg, from, args = [], settings }) => {
-    try {
-      if (!sock || !from) return;
+    const prefix = getPrefix(settings);
+    const action = String(args[0] || "help").trim().toLowerCase();
+    const data = readVip();
+    cleanupVip(data);
+    saveVip(data);
 
-      if (!esOwner(msg, from, settings)) {
-        return sock.sendMessage(from, { text: "👑 Solo el owner puede usar este comando." }, { quoted: msg });
+    if (action === "help") {
+      return sock.sendMessage(
+        from,
+        {
+          text:
+            `*PANEL VIP*\n\n` +
+            `${prefix}vip add 519xxxxxxxx 7d 50\n` +
+            `${prefix}vip extend 519xxxxxxxx 3d 20\n` +
+            `${prefix}vip del 519xxxxxxxx\n` +
+            `${prefix}vip check 519xxxxxxxx\n` +
+            `${prefix}vip list\n` +
+            `${prefix}vip top\n` +
+            `${prefix}vip stats`,
+          ...global.channelInfo,
+        },
+        { quoted: msg }
+      );
+    }
+
+    if (action === "list") {
+      const now = Date.now();
+      const users = Object.entries(data.users || {}).sort((a, b) => a[0].localeCompare(b[0]));
+      return sock.sendMessage(
+        from,
+        {
+          text:
+            `*VIP ACTIVOS*\n\n` +
+            (users.length
+              ? users
+                  .map(([number, info]) => {
+                    const uses = Number.isFinite(Number(info.usesLeft)) ? info.usesLeft : "∞";
+                    const left = Number.isFinite(Number(info.expiresAt))
+                      ? formatDuration(Number(info.expiresAt) - now)
+                      : "∞";
+                    return `• ${number} | usos: ${uses} | vence: ${left}`;
+                  })
+                  .join("\n")
+              : "No hay VIP activos."),
+          ...global.channelInfo,
+        },
+        { quoted: msg }
+      );
+    }
+
+    if (action === "check") {
+      const number = normalizeNumber(args[1]);
+      const info = data.users[number];
+      if (!number || !info) {
+        return sock.sendMessage(from, { text: "Ese numero no es VIP.", ...global.channelInfo }, { quoted: msg });
       }
 
-      const sub = String(args[0] || "").toLowerCase().trim();
-      const data = readVip();
-      limpiar(data);
-      saveVip(data);
+      return sock.sendMessage(
+        from,
+        {
+          text:
+            `*VIP CHECK*\n\n` +
+            `Numero: *${number}*\n` +
+            `Usos: *${Number.isFinite(Number(info.usesLeft)) ? info.usesLeft : "∞"}*\n` +
+            `Vence en: *${Number.isFinite(Number(info.expiresAt)) ? formatDuration(Number(info.expiresAt) - Date.now()) : "∞"}*`,
+          ...global.channelInfo,
+        },
+        { quoted: msg }
+      );
+    }
 
-      if (!sub) {
+    if (action === "stats") {
+      const users = Object.values(data.users || {});
+      const soonest = users
+        .filter((item) => Number.isFinite(Number(item.expiresAt)))
+        .sort((a, b) => Number(a.expiresAt || 0) - Number(b.expiresAt || 0))[0];
+
+      return sock.sendMessage(
+        from,
+        {
+          text:
+            `*VIP STATS*\n\n` +
+            `Activos: *${users.length}*\n` +
+            `Con usos limitados: *${users.filter((item) => Number.isFinite(Number(item.usesLeft))).length}*\n` +
+            `Vencimiento mas cercano: *${soonest ? formatDuration(Number(soonest.expiresAt || 0) - Date.now()) : "N/A"}*`,
+          ...global.channelInfo,
+        },
+        { quoted: msg }
+      );
+    }
+
+    if (action === "top") {
+      const now = Date.now();
+      const users = Object.entries(data.users || {})
+        .map(([number, info]) => ({
+          number,
+          usesLeft: Number(info?.usesLeft || 0),
+          timeLeft: Number(info?.expiresAt || 0) - now,
+        }))
+        .sort((a, b) => {
+          if (b.usesLeft !== a.usesLeft) return b.usesLeft - a.usesLeft;
+          return b.timeLeft - a.timeLeft;
+        })
+        .slice(0, 10);
+
+      return sock.sendMessage(
+        from,
+        {
+          text:
+            `*TOP VIP*\n\n` +
+            (users.length
+              ? users
+                  .map(
+                    (entry, index) =>
+                      `${index + 1}. ${entry.number} | usos ${entry.usesLeft} | ${formatDuration(entry.timeLeft)}`
+                  )
+                  .join("\n")
+              : "No hay VIP activos."),
+          ...global.channelInfo,
+        },
+        { quoted: msg }
+      );
+    }
+
+    if (action === "add" || action === "extend") {
+      const number = normalizeNumber(args[1]);
+      const durationMs = parseDurationToMs(args[2]);
+      const usesLeft = Number(args[3] || 0);
+
+      if (!number || !durationMs || !usesLeft) {
         return sock.sendMessage(
           from,
           {
-            text:
-              `🔒 *Panel VIP*\n\n` +
-              `➕ Dar VIP:\n` +
-              `• *.vip add 519xxxxxxx 7d 50*\n\n` +
-              `➖ Quitar VIP:\n` +
-              `• *.vip del 519xxxxxxx*\n\n` +
-              `📋 Ver:\n` +
-              `• *.vip list*\n` +
-              `• *.vip check 519xxxxxxx*`,
+            text: `Uso: ${prefix}vip ${action} 519xxxxxxxx 7d 50`,
+            ...global.channelInfo,
           },
           { quoted: msg }
         );
       }
 
-      if (sub === "list") {
-        const users = Object.entries(data.users || {});
-        if (!users.length) return sock.sendMessage(from, { text: "📋 VIP actuales: (vacío)" }, { quoted: msg });
+      const previous = data.users[number] || {};
+      const baseExpire =
+        action === "extend" && Number(previous.expiresAt || 0) > Date.now()
+          ? Number(previous.expiresAt)
+          : Date.now();
+      const next = {
+        expiresAt: baseExpire + durationMs,
+        usesLeft:
+          action === "extend"
+            ? Number(previous.usesLeft || 0) + usesLeft
+            : usesLeft,
+      };
 
-        const now = Date.now();
-        const lines = users
-          .sort((a, b) => a[0].localeCompare(b[0]))
-          .map(([num, info]) => {
-            const left = typeof info.usesLeft === "number" ? info.usesLeft : "∞";
-            const exp = typeof info.expiresAt === "number" ? fmtMs(info.expiresAt - now) : "∞";
-            return `• ${num} — 🎟️ *${left}* — ⏳ *${exp}*`;
-          });
+      data.users[number] = next;
+      saveVip(data);
 
-        return sock.sendMessage(from, { text: `📋 *VIP actuales:*\n\n${lines.join("\n")}` }, { quoted: msg });
-      }
-
-      if (sub === "check") {
-        const num = normId(args[1]);
-        if (!num) return sock.sendMessage(from, { text: "⚠️ Uso: *.vip check 519xxxxxxx*" }, { quoted: msg });
-
-        const info = data.users?.[num];
-        if (!info) return sock.sendMessage(from, { text: `❌ *${num}* no es VIP.` }, { quoted: msg });
-
-        const now = Date.now();
-        const left = typeof info.usesLeft === "number" ? info.usesLeft : "∞";
-        const exp = typeof info.expiresAt === "number" ? fmtMs(info.expiresAt - now) : "∞";
-
-        return sock.sendMessage(from, { text: `✅ *${num}* es VIP\n🎟️ usos: *${left}*\n⏳ vence en: *${exp}*` }, { quoted: msg });
-      }
-
-      if (sub === "add") {
-        const num = normId(args[1]);
-        const durStr = args[2];
-        const usesStr = args[3];
-
-        if (!num || !durStr || !usesStr) {
-          return sock.sendMessage(from, { text: "⚠️ Uso: *.vip add 519xxxxxxx 7d 50*" }, { quoted: msg });
-        }
-
-        const durMs = parseDurationToMs(durStr);
-        const uses = parseInt(usesStr, 10);
-        if (!durMs) return sock.sendMessage(from, { text: "⚠️ Duración inválida (7d/12h/30m/20s)." }, { quoted: msg });
-        if (!Number.isFinite(uses) || uses <= 0) return sock.sendMessage(from, { text: "⚠️ Usos inválidos." }, { quoted: msg });
-
-        data.users[num] = { expiresAt: Date.now() + durMs, usesLeft: uses };
-        saveVip(data);
-
-        return sock.sendMessage(from, { text: `✅ VIP agregado: *${num}*\n⏳ duración: *${durStr}*\n🎟️ usos: *${uses}*` }, { quoted: msg });
-      }
-
-      if (sub === "del" || sub === "remove" || sub === "rm") {
-        const num = normId(args[1]);
-        if (!num) return sock.sendMessage(from, { text: "⚠️ Uso: *.vip del 519xxxxxxx*" }, { quoted: msg });
-
-        delete data.users[num];
-        saveVip(data);
-        return sock.sendMessage(from, { text: `🗑️ VIP eliminado: *${num}*` }, { quoted: msg });
-      }
-
-      return sock.sendMessage(from, { text: "⚠️ Subcomando inválido. Usa *.vip*" }, { quoted: msg });
-    } catch (e) {
-      console.error("[VIP] Error:", e);
-      return sock.sendMessage(from, { text: "❌ Error en VIP. Revisa consola." }, { quoted: msg });
+      return sock.sendMessage(
+        from,
+        {
+          text:
+            `VIP ${action === "add" ? "agregado" : "extendido"}.\n` +
+            `Numero: *${number}*\n` +
+            `Usos: *${next.usesLeft}*\n` +
+            `Vence en: *${formatDuration(next.expiresAt - Date.now())}*`,
+          ...global.channelInfo,
+        },
+        { quoted: msg }
+      );
     }
+
+    if (action === "del" || action === "remove" || action === "rm") {
+      const number = normalizeNumber(args[1]);
+      delete data.users[number];
+      saveVip(data);
+      return sock.sendMessage(from, { text: `VIP eliminado: *${number || "sin numero"}*`, ...global.channelInfo }, { quoted: msg });
+    }
+
+    return sock.sendMessage(
+      from,
+      {
+        text: `Subcomando invalido. Usa ${prefix}vip`,
+        ...global.channelInfo,
+      },
+      { quoted: msg }
+    );
   },
 };

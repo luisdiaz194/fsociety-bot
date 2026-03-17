@@ -5,6 +5,7 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
+    "check": "node --check index.js",
     "pm2:auto:start": "pm2 start ecosystem.config.cjs",
     "pm2:auto:restart": "pm2 restart ecosystem.config.cjs",
     "pm2:split:start": "pm2 start ecosystem.config.cjs",

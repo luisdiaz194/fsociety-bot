@@ -1,5 +1,6 @@
 import fs from "fs";
 import path from "path";
+import { recordWeeklyCoins, recordWeeklyGame } from "../../lib/weekly.js";
 
 const DB_DIR = path.join(process.cwd(), "database");
 const FILE = path.join(DB_DIR, "economy.json");
@@ -79,9 +80,12 @@ function ensureUser(userId) {
       coins: 0,
       totalEarned: 0,
       totalSpent: 0,
+      bank: 0,
+      totalBanked: 0,
       inventory: {},
       lastDailyAt: 0,
       lastGameRewardAt: 0,
+      lastWorkAt: 0,
       history: [],
     };
   }
@@ -92,6 +96,15 @@ function ensureUser(userId) {
   }
   if (!Array.isArray(user.history)) {
     user.history = [];
+  }
+  if (!Number.isFinite(Number(user.bank))) {
+    user.bank = 0;
+  }
+  if (!Number.isFinite(Number(user.totalBanked))) {
+    user.totalBanked = 0;
+  }
+  if (!Number.isFinite(Number(user.lastWorkAt))) {
+    user.lastWorkAt = 0;
   }
   return user;
 }
@@ -134,6 +147,9 @@ export function addCoins(userId, amount, reason = "bonus", meta = {}) {
     reason,
     meta,
   });
+  if (normalizedAmount > 0) {
+    recordWeeklyCoins({ userId, amount: normalizedAmount });
+  }
   scheduleSave();
   return user;
 }
@@ -247,10 +263,12 @@ export function getTopCoins(limit = 10) {
     .map((user) => ({
       id: user.id,
       coins: Number(user.coins || 0),
+      bank: Number(user.bank || 0),
+      total: Number(user.coins || 0) + Number(user.bank || 0),
       totalEarned: Number(user.totalEarned || 0),
     }))
     .sort((a, b) => {
-      if (b.coins !== a.coins) return b.coins - a.coins;
+      if (b.total !== a.total) return b.total - a.total;
       return b.totalEarned - a.totalEarned;
     })
     .slice(0, Math.max(1, Math.min(20, Number(limit || 10))));
@@ -274,8 +292,133 @@ export function awardGameCoins({ userId, chatId, game, outcome = "win", points =
 
   if (user) {
     user.lastGameRewardAt = Date.now();
+    recordWeeklyGame({ userId, outcome: normalizedOutcome });
     scheduleSave();
   }
 
   return reward;
+}
+
+export function depositCoins(userId, amount) {
+  const user = ensureUser(userId);
+  if (!user) return { ok: false, status: "missing_user" };
+
+  const normalizedAmount = Math.max(0, Math.floor(Number(amount || 0)));
+  if (!normalizedAmount) return { ok: false, status: "invalid_amount" };
+
+  const spend = spendCoins(userId, normalizedAmount, "bank_deposit");
+  if (!spend.ok) {
+    return { ok: false, status: "insufficient", missing: spend.missing, user: spend.user };
+  }
+
+  user.bank += normalizedAmount;
+  user.totalBanked += normalizedAmount;
+  pushHistory(user, {
+    type: "bank_in",
+    amount: normalizedAmount,
+    reason: "bank_deposit",
+  });
+  scheduleSave();
+  return { ok: true, user };
+}
+
+export function withdrawCoins(userId, amount) {
+  const user = ensureUser(userId);
+  if (!user) return { ok: false, status: "missing_user" };
+
+  const normalizedAmount = Math.max(0, Math.floor(Number(amount || 0)));
+  if (!normalizedAmount) return { ok: false, status: "invalid_amount" };
+  if (user.bank < normalizedAmount) {
+    return { ok: false, status: "insufficient_bank", missing: normalizedAmount - user.bank, user };
+  }
+
+  user.bank -= normalizedAmount;
+  user.coins += normalizedAmount;
+  pushHistory(user, {
+    type: "bank_out",
+    amount: normalizedAmount,
+    reason: "bank_withdraw",
+  });
+  scheduleSave();
+  return { ok: true, user };
+}
+
+export function transferCoins(fromUserId, toUserId, amount) {
+  const sender = ensureUser(fromUserId);
+  const target = ensureUser(toUserId);
+  if (!sender || !target) return { ok: false, status: "missing_user" };
+
+  const normalizedAmount = Math.max(0, Math.floor(Number(amount || 0)));
+  if (!normalizedAmount) return { ok: false, status: "invalid_amount" };
+
+  const spend = spendCoins(fromUserId, normalizedAmount, "transfer_out", { to: normalizeJidUser(toUserId) });
+  if (!spend.ok) {
+    return { ok: false, status: "insufficient", missing: spend.missing, user: spend.user };
+  }
+
+  addCoins(toUserId, normalizedAmount, "transfer_in", { from: normalizeJidUser(fromUserId) });
+  pushHistory(target, {
+    type: "transfer_in",
+    amount: normalizedAmount,
+    reason: "transfer_in",
+    meta: { from: normalizeJidUser(fromUserId) },
+  });
+  scheduleSave();
+  return { ok: true, sender: ensureUser(fromUserId), target: ensureUser(toUserId) };
+}
+
+const WORK_COOLDOWN_MS = 60 * 60 * 1000;
+
+export function claimWorkReward(userId) {
+  const user = ensureUser(userId);
+  if (!user) return { ok: false, status: "missing_user", remainingMs: 0 };
+
+  const now = Date.now();
+  const elapsed = now - Number(user.lastWorkAt || 0);
+  if (elapsed < WORK_COOLDOWN_MS) {
+    return { ok: false, status: "cooldown", remainingMs: WORK_COOLDOWN_MS - elapsed, user };
+  }
+
+  const reward = 180 + Math.floor(Math.random() * 271);
+  user.lastWorkAt = now;
+  addCoins(userId, reward, "work_reward");
+  scheduleSave();
+  return { ok: true, amount: reward, user: ensureUser(userId), remainingMs: 0 };
+}
+
+export function gambleCoins(userId, amount) {
+  const user = ensureUser(userId);
+  if (!user) return { ok: false, status: "missing_user" };
+
+  const normalizedAmount = Math.max(0, Math.floor(Number(amount || 0)));
+  if (!normalizedAmount) return { ok: false, status: "invalid_amount" };
+
+  const spend = spendCoins(userId, normalizedAmount, "bet_place");
+  if (!spend.ok) {
+    return { ok: false, status: "insufficient", missing: spend.missing, user: spend.user };
+  }
+
+  const roll = Math.random();
+  let profit = 0;
+  let outcome = "loss";
+
+  if (roll >= 0.88) {
+    profit = normalizedAmount * 2;
+    outcome = "jackpot";
+  } else if (roll >= 0.45) {
+    profit = normalizedAmount;
+    outcome = "win";
+  }
+
+  if (profit > 0) {
+    addCoins(userId, normalizedAmount + profit, "bet_win", { stake: normalizedAmount });
+  }
+
+  return {
+    ok: true,
+    outcome,
+    stake: normalizedAmount,
+    profit,
+    user: ensureUser(userId),
+  };
 }

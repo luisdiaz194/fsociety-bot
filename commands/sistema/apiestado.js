@@ -1,49 +1,4 @@
-const CHECKS = [
-  {
-    name: "DVYER ytsearch",
-    url: "https://dv-yer-api.online/ytsearch?q=ozuna&limit=1",
-  },
-  {
-    name: "DVYER ytdlmp3",
-    url: "https://dv-yer-api.online/ytdlmp3",
-  },
-  {
-    name: "DVYER ytdlmp4",
-    url: "https://dv-yer-api.online/ytdlmp4",
-  },
-  {
-    name: "DVYER tiktok",
-    url: "https://dv-yer-api.online/ttdlmp4",
-  },
-  {
-    name: "DVYER spotify",
-    url: "https://dv-yer-api.online/spotify",
-  },
-  {
-    name: "DVYER instagram",
-    url: "https://dv-yer-api.online/instagram",
-  },
-  {
-    name: "DVYER apksearch",
-    url: "https://dv-yer-api.online/apksearch?q=whatsapp&limit=1",
-  },
-  {
-    name: "TikTok Search Fallback",
-    url: "https://www.tikwm.com/api/feed/search?keywords=ozuna&count=1&cursor=0&web=1",
-  },
-  {
-    name: "Pinterest Fallback",
-    url: "https://www.bing.com/images/search?q=cat",
-  },
-  {
-    name: "IA GPT",
-    url: "https://api.soymaycol.icu/api/ai/gpt5?prompt=hola",
-  },
-  {
-    name: "Legacy Nexevo",
-    url: "https://nexevo.onrender.com/search/pinterest?q=cat",
-  },
-];
+import { getApiChecks, listProviders } from "../../lib/api-manager.js";
 
 function classifyStatus(status) {
   if (status >= 200 && status < 300) return "ACTIVA";
@@ -112,14 +67,19 @@ export default {
     );
 
     const results = await Promise.all(
-      CHECKS.map(async (check) => ({
+      getApiChecks().map(async (check) => ({
         ...check,
         ...(await probeUrl(check.url)),
       }))
     );
 
+    const providerText = listProviders()
+      .map((provider) => `• ${provider.name}: ${provider.enabled === false ? "OFF" : "ON"}`)
+      .join("\n");
+
     const text =
       `*API ESTADO*\n\n` +
+      `*PROVEEDORES*\n${providerText}\n\n` +
       results
         .map((item) => {
           const extra = item.error ? ` - ${item.error}` : "";

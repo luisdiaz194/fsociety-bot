@@ -3,12 +3,18 @@ import path from "path";
 import axios from "axios";
 import { pipeline } from "stream/promises";
 import { spawn } from "child_process";
+import { buildDvyerUrl, getDvyerBaseUrl } from "../../lib/api-manager.js";
+import { getDownloadCache, setDownloadCache, withInflightDedup } from "../../lib/download-cache.js";
 
-const API_BASE = "https://dv-yer-api.online";
-const API_AUDIO_URL = `${API_BASE}/ytdlmp3`;
-const API_AUDIO_LEGACY_URL = `${API_BASE}/ytmp3`;
-const API_AUDIO_ALT_URL = `${API_BASE}/ytaltmp3`;
-const API_SEARCH_URL = `${API_BASE}/ytsearch`;
+const API_AUDIO_PATH = "/ytdlmp3";
+const API_AUDIO_LEGACY_PATH = "/ytmp3";
+const API_AUDIO_ALT_PATH = "/ytaltmp3";
+const API_SEARCH_PATH = "/ytsearch";
+const API_BASE = getDvyerBaseUrl();
+const API_AUDIO_URL = buildDvyerUrl(API_AUDIO_PATH);
+const API_AUDIO_LEGACY_URL = buildDvyerUrl(API_AUDIO_LEGACY_PATH);
+const API_AUDIO_ALT_URL = buildDvyerUrl(API_AUDIO_ALT_PATH);
+const API_SEARCH_URL = buildDvyerUrl(API_SEARCH_PATH);
 
 const COOLDOWN_TIME = 15 * 1000;
 const AUDIO_QUALITY = "128k";
@@ -127,12 +133,16 @@ function isHttpUrl(value) {
   return /^https?:\/\//i.test(String(value || ""));
 }
 
+function apiBaseLabel() {
+  return getDvyerBaseUrl();
+}
+
 function normalizeApiUrl(url) {
   const value = String(url || "").trim();
   if (!value) return "";
   if (/^https?:\/\//i.test(value)) return value;
-  if (value.startsWith("/")) return `${API_BASE}${value}`;
-  return `${API_BASE}/${value}`;
+  if (value.startsWith("/")) return `${apiBaseLabel()}${value}`;
+  return `${apiBaseLabel()}/${value}`;
 }
 
 function pickApiDownloadUrl(data) {
@@ -299,6 +309,30 @@ async function resolveFastestAudioLink(videoUrl) {
         "No se pudo obtener un enlace de descarga desde las rutas internas."
     );
   }
+}
+
+async function resolveSearchCached(query) {
+  const cacheKey = `ytsearch:${String(query || "").trim().toLowerCase()}`;
+  const cached = getDownloadCache(cacheKey);
+  if (cached?.videoUrl) return cached;
+
+  return withInflightDedup(cacheKey, async () => {
+    const result = await resolveSearch(query);
+    setDownloadCache(cacheKey, result);
+    return result;
+  });
+}
+
+async function resolveFastestAudioLinkCached(videoUrl) {
+  const cacheKey = `ytdlmp3:${String(videoUrl || "").trim()}`;
+  const cached = getDownloadCache(cacheKey);
+  if (cached?.downloadUrl) return cached;
+
+  return withInflightDedup(cacheKey, async () => {
+    const result = await resolveFastestAudioLink(videoUrl);
+    setDownloadCache(cacheKey, result);
+    return result;
+  });
 }
 
 async function downloadAudioFromInternalLink(downloadUrl, outputPath, suggestedFileName = "audio.bin") {
@@ -588,7 +622,7 @@ export default {
           });
         }
 
-        const search = await resolveSearch(rawInput);
+        const search = await resolveSearchCached(rawInput);
         videoUrl = search.videoUrl;
         title = search.title;
         thumbnail = search.thumbnail;
@@ -617,7 +651,7 @@ export default {
       let downloadedAudio = null;
 
       try {
-        const fastestLink = await resolveFastestAudioLink(videoUrl);
+        const fastestLink = await resolveFastestAudioLinkCached(videoUrl);
         title = safeFileName(fastestLink.title || finalTitle || "audio");
 
         console.log(

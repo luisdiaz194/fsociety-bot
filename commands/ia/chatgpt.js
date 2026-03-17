@@ -1,4 +1,5 @@
 import axios from "axios";
+import { getGpt5Url, getProvider } from "../../lib/api-manager.js";
 
 function getPrefix(settings) {
   if (Array.isArray(settings?.prefix)) {
@@ -27,7 +28,16 @@ export default {
     }
 
     try {
-      const url = `https://api.soymaycol.icu/api/ai/gpt5?prompt=${encodeURIComponent(prompt)}`;
+      const provider = getProvider("ai");
+      if (provider?.enabled === false) {
+        return sock.sendMessage(
+          from,
+          { text: "La IA esta desactivada por el owner.", ...global.channelInfo },
+          { quoted: msg }
+        );
+      }
+
+      const url = getGpt5Url(prompt);
       const { data } = await axios.get(url, { timeout: 60000 });
 
       if (!data?.status) {

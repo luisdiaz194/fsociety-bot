@@ -1,0 +1,89 @@
+import { formatBytes, formatDuration, getPrimaryPrefix } from "../../lib/json-store.js";
+
+export default {
+  name: "autoclean",
+  command: ["autoclean", "autolimpieza", "cleaner"],
+  category: "sistema",
+  description: "Limpia temporales y backups viejos automaticamente",
+  ownerOnly: true,
+
+  run: async ({ sock, msg, from, args = [], settings }) => {
+    const runtime = global.botRuntime;
+    const prefix = getPrimaryPrefix(settings);
+    const action = String(args[0] || "status").trim().toLowerCase();
+
+    if (!runtime?.getAutoCleanState || !runtime?.setAutoCleanConfig || !runtime?.runAutoClean) {
+      return sock.sendMessage(from, { text: "No pude abrir el autoclean.", ...global.channelInfo }, { quoted: msg });
+    }
+
+    if (action === "on" || action === "off") {
+      const state = runtime.setAutoCleanConfig({ enabled: action === "on" });
+      return sock.sendMessage(
+        from,
+        {
+          text: `Autoclean: *${state.enabled ? "ENCENDIDO" : "APAGADO"}*`,
+          ...global.channelInfo,
+        },
+        { quoted: msg }
+      );
+    }
+
+    if (action === "run" || action === "now") {
+      const result = runtime.runAutoClean();
+      return sock.sendMessage(
+        from,
+        {
+          text:
+            `*AUTO CLEAN EJECUTADO*\n\n` +
+            `Archivos borrados: *${result.removedFiles}*\n` +
+            `Espacio liberado: *${result.freedLabel}*`,
+          ...global.channelInfo,
+        },
+        { quoted: msg }
+      );
+    }
+
+    if (action === "config") {
+      const intervalMinutes = Number(args[1] || 30);
+      const ageMinutes = Number(args[2] || 360);
+      const state = runtime.setAutoCleanConfig({
+        intervalMs: intervalMinutes * 60 * 1000,
+        maxFileAgeMs: ageMinutes * 60 * 1000,
+      });
+
+      return sock.sendMessage(
+        from,
+        {
+          text:
+            `Autoclean actualizado.\n` +
+            `Intervalo: *${formatDuration(state.intervalMs)}*\n` +
+            `Edad maxima: *${formatDuration(state.maxFileAgeMs)}*`,
+          ...global.channelInfo,
+        },
+        { quoted: msg }
+      );
+    }
+
+    const state = runtime.getAutoCleanState();
+
+    return sock.sendMessage(
+      from,
+      {
+        text:
+          `*AUTO CLEAN*\n\n` +
+          `Estado: *${state.enabled ? "ENCENDIDO" : "APAGADO"}*\n` +
+          `Intervalo: *${formatDuration(state.intervalMs)}*\n` +
+          `Edad maxima: *${formatDuration(state.maxFileAgeMs)}*\n` +
+          `Ultima ejecucion: *${state.lastRunAt ? new Date(state.lastRunAt).toLocaleString("es-PE") : "Nunca"}*\n` +
+          `Ultimo borrado: *${state.lastSummary.removedFiles} archivos / ${formatBytes(state.lastSummary.freedBytes)}*\n\n` +
+          `Uso:\n` +
+          `${prefix}autoclean on\n` +
+          `${prefix}autoclean off\n` +
+          `${prefix}autoclean run\n` +
+          `${prefix}autoclean config 30 360`,
+        ...global.channelInfo,
+      },
+      { quoted: msg }
+    );
+  },
+};
