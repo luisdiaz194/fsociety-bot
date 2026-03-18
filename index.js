@@ -1,5 +1,5 @@
 // =========================
-// DVYER BOT - INDEX (MULTI BOT)
+// FSOCIETY BOT - INDEX (MULTI BOT)
 // =========================
 
 import * as baileys from "@whiskeysockets/baileys";
@@ -393,6 +393,17 @@ function ensureSystemSettings(currentSettings) {
   );
   currentSettings.system.maintenanceMessage =
     String(currentSettings.system.maintenanceMessage || "").trim().slice(0, 240);
+  currentSettings.system.autoProfileOnConnect = currentSettings.system.autoProfileOnConnect !== false;
+  currentSettings.system.mainBotBio =
+    String(currentSettings.system.mainBotBio || `Ya conectado bot ${currentSettings?.botName || "Fsociety bot"}`)
+      .trim()
+      .slice(0, 139);
+  currentSettings.system.mainBotPhoto = String(currentSettings.system.mainBotPhoto || "").trim();
+  currentSettings.system.subbotBioTemplate =
+    String(currentSettings.system.subbotBioTemplate || "Subbot Fsociety activo")
+      .trim()
+      .slice(0, 139);
+  currentSettings.system.subbotPhoto = String(currentSettings.system.subbotPhoto || "").trim();
 }
 
 function saveSettingsFile() {
@@ -451,8 +462,164 @@ function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function getBotSlot(botId = "") {
+  const match = String(botId || "")
+    .trim()
+    .toLowerCase()
+    .match(/^subbot(\d{1,2})$/);
+  return match ? Number.parseInt(match[1], 10) : 0;
+}
+
 function sanitizePhoneNumber(value) {
   return String(value || "").replace(/\D/g, "");
+}
+
+function resolveConfiguredBotName(config = {}) {
+  if (String(config?.id || "").toLowerCase() === "main") {
+    return String(settings?.botName || "Fsociety bot").trim() || "Fsociety bot";
+  }
+
+  const slot = getBotSlot(config?.id || config?.slot);
+  const slotConfig =
+    slot >= 1 && Array.isArray(settings?.subbots) ? settings.subbots[slot - 1] : null;
+
+  return (
+    String(slotConfig?.name || config?.displayName || `Fsociety Subbot ${slot || 1}`)
+      .trim() || `Fsociety Subbot ${slot || 1}`
+  );
+}
+
+function resolveConfiguredBotBio(config = {}) {
+  ensureSystemSettings(settings);
+
+  if (String(config?.id || "").toLowerCase() === "main") {
+    return (
+      String(settings?.system?.mainBotBio || `Ya conectado bot ${resolveConfiguredBotName(config)}`)
+        .trim()
+        .slice(0, 139) || `Ya conectado bot ${resolveConfiguredBotName(config)}`
+    );
+  }
+
+  const slot = getBotSlot(config?.id || config?.slot);
+  const slotConfig =
+    slot >= 1 && Array.isArray(settings?.subbots) ? settings.subbots[slot - 1] : null;
+
+  return (
+    String(slotConfig?.bio || settings?.system?.subbotBioTemplate || "Subbot Fsociety activo")
+      .trim()
+      .slice(0, 139) || "Subbot Fsociety activo"
+  );
+}
+
+function resolveConfiguredBotPhoto(config = {}) {
+  ensureSystemSettings(settings);
+
+  if (String(config?.id || "").toLowerCase() === "main") {
+    return String(settings?.system?.mainBotPhoto || "").trim();
+  }
+
+  const slot = getBotSlot(config?.id || config?.slot);
+  const slotConfig =
+    slot >= 1 && Array.isArray(settings?.subbots) ? settings.subbots[slot - 1] : null;
+
+  return String(slotConfig?.photo || settings?.system?.subbotPhoto || "").trim();
+}
+
+async function resolveBotProfilePhotoSource(config = {}) {
+  const input = resolveConfiguredBotPhoto(config);
+  if (!input) return null;
+
+  if (/^https?:\/\//i.test(input)) {
+    const response = await fetch(input, {
+      method: "GET",
+      headers: {
+        "User-Agent": "Mozilla/5.0",
+      },
+    });
+
+    if (!response.ok) {
+      throw new Error(`No pude descargar la foto de perfil (${response.status}).`);
+    }
+
+    const tempFile = path.join(TMP_DIR, `auto-profile-${Date.now()}.jpg`);
+    fs.writeFileSync(tempFile, Buffer.from(await response.arrayBuffer()));
+    return {
+      path: tempFile,
+      temporary: true,
+    };
+  }
+
+  const localPath = path.isAbsolute(input) ? input : path.join(process.cwd(), input);
+  if (!fs.existsSync(localPath)) {
+    throw new Error("La ruta local de la foto de perfil no existe.");
+  }
+
+  return {
+    path: localPath,
+    temporary: false,
+  };
+}
+
+async function applyConfiguredBotProfile(botState, sock) {
+  ensureSystemSettings(settings);
+
+  if (!settings?.system?.autoProfileOnConnect || !sock?.user?.id) {
+    return;
+  }
+
+  const desiredName = resolveConfiguredBotName(botState?.config);
+  const desiredBio = resolveConfiguredBotBio(botState?.config);
+  const desiredPhoto = resolveConfiguredBotPhoto(botState?.config);
+  const signature = JSON.stringify({
+    desiredName,
+    desiredBio,
+    desiredPhoto,
+  });
+
+  if (
+    botState?.lastProfileSignature === signature &&
+    Date.now() - Number(botState?.lastProfileAppliedAt || 0) < 10 * 60 * 1000
+  ) {
+    return;
+  }
+
+  if (typeof sock.updateProfileName === "function" && desiredName) {
+    try {
+      await sock.updateProfileName(desiredName);
+    } catch (error) {
+      console.log(`${getBotTag(botState)} No pude actualizar el nombre del perfil: ${error?.message || error}`);
+    }
+  }
+
+  if (typeof sock.updateProfileStatus === "function" && desiredBio) {
+    try {
+      await sock.updateProfileStatus(desiredBio);
+    } catch (error) {
+      console.log(`${getBotTag(botState)} No pude actualizar la bio del perfil: ${error?.message || error}`);
+    }
+  }
+
+  if (typeof sock.updateProfilePicture === "function" && desiredPhoto) {
+    let photoSource = null;
+
+    try {
+      photoSource = await resolveBotProfilePhotoSource(botState?.config);
+      if (photoSource?.path) {
+        await sock.updateProfilePicture(sock.user.id, { url: photoSource.path });
+      }
+    } catch (error) {
+      console.log(`${getBotTag(botState)} No pude actualizar la foto del perfil: ${error?.message || error}`);
+    } finally {
+      if (photoSource?.temporary) {
+        try {
+          fs.rmSync(photoSource.path, { force: true });
+        } catch {}
+      }
+    }
+  }
+
+  botState.lastProfileSignature = signature;
+  botState.lastProfileAppliedAt = Date.now();
 }
 
 function runPm2Command(args = [], extraEnv = {}) {
@@ -1249,6 +1416,8 @@ function ensureBotState(config) {
     replacementBlockedAt: 0,
     replacementBlockedUntil: 0,
     reconnectAttempts: 0,
+    lastProfileSignature: "",
+    lastProfileAppliedAt: 0,
     reconnectTimer: null,
     groupCache: new Map(),
     store: createStoreForBot(config.id),
@@ -2041,9 +2210,9 @@ function banner() {
 
   console.log(
     chalk.magentaBright(`
-+------------------------------+
-|        DVYER BOT v2          |
-+------------------------------+
++--------------------------------------+
+|        ${String(settings?.botName || "Fsociety bot").toUpperCase().padEnd(28, " ")}|
++--------------------------------------+
 `)
   );
 
@@ -3226,8 +3395,11 @@ async function iniciarInstanciaBot(config) {
           botState.lastDisconnectAt = 0;
           resetPairingCache(botState);
           botState.pairingCommandHintShown = false;
+          await applyConfiguredBotProfile(botState, sock);
           console.log(
-            chalk.green(`${getBotTag(botState)} ${config.displayName} conectado`)
+            chalk.green(
+              `${getBotTag(botState)} Ya conectado bot ${resolveConfiguredBotName(config)}`
+            )
           );
           writePersistedBotRuntimeState(botState);
 
