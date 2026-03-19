@@ -1,6 +1,7 @@
 import {
   formatCoins,
   formatUserLabel,
+  formatUserPhone,
   getDownloadRequestState,
   getEconomyConfig,
   getEconomyProfile,
@@ -27,7 +28,7 @@ export default {
         text:
           `*ECONOMIA DE ${formatUserLabel(sender)}*\n\n` +
           `Nombre: *${profile?.lastKnownName || "Sin nombre"}*\n` +
-          `Numero: *${profile?.phone ? `+${profile.phone}` : formatUserLabel(sender)}*\n` +
+          `Numero: *${formatUserPhone(sender) || "Sin numero visible"}*\n` +
           `Dolares: *${formatCoins(profile?.coins || 0)}*\n` +
           `Banco: *${formatCoins(profile?.bank || 0)}*\n` +
           `Total actual: *${formatCoins(Number(profile?.coins || 0) + Number(profile?.bank || 0))}*\n` +

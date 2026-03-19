@@ -921,8 +921,40 @@ function serializeMessage(raw) {
     chat: from,
     isGroup: from.endsWith("@g.us"),
     pushName: String(raw?.pushName || raw?.notifyName || raw?.verifiedBizName || "").trim(),
+    senderPhone: String(raw?.key?.participantPn || raw?.key?.senderPn || "").trim(),
+    senderLid: String(raw?.key?.participantLid || raw?.key?.senderLid || "").trim(),
     quoted,
   };
+}
+
+function getStoreContactName(botState, ...ids) {
+  const contacts = botState?.store?.contacts;
+  if (!contacts || typeof contacts !== "object") return "";
+
+  for (const value of ids) {
+    const raw = String(value || "").trim();
+    if (!raw) continue;
+
+    const normalized = normalizeJidUser(raw);
+    const candidates = [raw];
+
+    if (normalized) {
+      candidates.push(`${normalized}@s.whatsapp.net`, `${normalized}@lid`);
+    }
+
+    for (const candidate of candidates) {
+      const entry = contacts?.[candidate];
+      const name = String(
+        entry?.notify || entry?.name || entry?.verifiedName || entry?.verifiedBizName || ""
+      ).trim();
+
+      if (name) {
+        return name;
+      }
+    }
+  }
+
+  return "";
 }
 
 async function getVersionSafe() {
@@ -3418,9 +3450,26 @@ async function handleIncomingMessages(botState, sock, messages) {
       if (blockedByHook) continue;
 
       if (!commandData) continue;
+      const contactName =
+        m.pushName ||
+        getStoreContactName(
+          botState,
+          m.sender,
+          m.senderPhone,
+          raw?.key?.participant,
+          raw?.key?.participantPn
+        );
       touchEconomyProfile(m.sender, settings, {
-        jid: m.sender,
-        name: m.pushName,
+        jid: m.senderPhone || m.sender,
+        phone: m.senderPhone,
+        senderPhone: m.senderPhone,
+        senderPn: raw?.key?.senderPn,
+        participantPn: raw?.key?.participantPn,
+        lid: m.senderLid,
+        senderLid: raw?.key?.senderLid,
+        participantLid: raw?.key?.participantLid,
+        name: contactName,
+        pushName: m.pushName,
         chatId: from,
         commandName: commandData.commandName,
         botId: botState.config.id,
@@ -3515,6 +3564,42 @@ async function iniciarInstanciaBot(config) {
     }
 
     sock.ev.on("creds.update", saveCreds);
+
+    const syncEconomyContact = (entry = {}) => {
+      if (!entry?.id) return;
+      touchEconomyProfile(entry.id, settings, {
+        jid: entry.id,
+        name: entry?.notify || entry?.name || entry?.verifiedName || entry?.verifiedBizName,
+        verifiedName: entry?.verifiedName || entry?.verifiedBizName || "",
+      });
+    };
+
+    sock.ev.on("contacts.update", (updates = []) => {
+      for (const update of updates || []) {
+        try {
+          syncEconomyContact(update);
+        } catch {}
+      }
+    });
+
+    sock.ev.on("contacts.upsert", (updates = []) => {
+      for (const update of updates || []) {
+        try {
+          syncEconomyContact(update);
+        } catch {}
+      }
+    });
+
+    sock.ev.on("chats.phoneNumberShare", (payload = {}) => {
+      try {
+        if (!payload?.lid || !payload?.jid) return;
+        touchEconomyProfile(payload.lid, settings, {
+          jid: payload.jid,
+          phone: payload.jid,
+          lid: payload.lid,
+        });
+      } catch {}
+    });
 
     sock.ev.on("groups.update", async (updates) => {
       for (const update of updates || []) {

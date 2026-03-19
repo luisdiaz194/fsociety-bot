@@ -4,6 +4,7 @@ import {
   addCoins,
   addDownloadRequests,
   formatCoins,
+  formatUserPhone,
   getDownloadRequestState,
   getEconomyConfig,
   getEconomyProfile,
@@ -202,7 +203,7 @@ export default {
           text:
             `*PERFIL ECONOMICO*\n\n` +
             `Nombre: *${profile?.lastKnownName || "Sin nombre"}*\n` +
-            `Usuario: *${target.replace("@s.whatsapp.net", "")}*\n` +
+            `Numero: *${formatUserPhone(target) || target.replace("@s.whatsapp.net", "")}*\n` +
             `JID: *${profile?.jid || target}*\n` +
             `Saldo: *${formatCoins(profile?.coins || 0)}*\n` +
             `Banco: *${formatCoins(profile?.bank || 0)}*\n` +
