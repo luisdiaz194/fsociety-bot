@@ -2,11 +2,9 @@ import fs from "fs";
 import path from "path";
 
 function formatUptime(seconds) {
-  seconds = Math.floor(Number(seconds || 0));
   const h = Math.floor(seconds / 3600);
   const m = Math.floor((seconds % 3600) / 60);
-  const s = seconds % 60;
-  return `${h}h ${m}m ${s}s`;
+  return `${h}h ${m}m`;
 }
 
 function getPrimaryPrefix(settings) {
@@ -39,52 +37,34 @@ function normalizeCategoryLabel(value = "") {
 function getCategoryIcon(category = "") {
   const key = String(category || "").trim().toLowerCase();
   const icons = {
-    admin: "[ADMIN]",
-    ai: "[AI]",
-    anime: "[ANIME]",
-    busqueda: "[BUSQUEDA]",
-    descarga: "[DESCARGA]",
-    descargas: "[DESCARGAS]",
-    economia: "[ECONOMIA]",
-    grupo: "[GRUPO]",
-    juegos: "[JUEGOS]",
-    menu: "[MENU]",
-    sistema: "[SISTEMA]",
-    subbots: "[SUBBOTS]",
-    vip: "[VIP]",
+    admin: "👑",
+    ai: "🧠",
+    anime: "🌸",
+    busqueda: "🔎",
+    descarga: "📥",
+    descargas: "📥",
+    economia: "💰",
+    grupo: "🛡️",
+    juegos: "🎮",
+    menu: "📜",
+    sistema: "⚙️",
+    subbots: "🤖",
+    vip: "💎",
   };
 
-  return icons[key] || "[OTROS]";
-}
-
-function buildCategoryMap(comandos) {
-  const categories = {};
-
-  for (const cmd of new Set(comandos?.values?.() || [])) {
-    if (!cmd?.category || !cmd?.command) continue;
-
-    const category = String(cmd.category || "").trim().toLowerCase();
-    const commandName = cmd.name || (Array.isArray(cmd.command) ? cmd.command[0] : cmd.command);
-    if (!category || !commandName) continue;
-
-    if (!categories[category]) categories[category] = new Set();
-    categories[category].add(String(commandName || "").trim().toLowerCase());
-  }
-
-  return categories;
+  return icons[key] || "✦";
 }
 
 function buildTopPanel({ settings, uptime, totalCategories, totalCommands, prefixLabel }) {
   return [
-    "+------------------------------+",
-    "|        MENU PRINCIPAL        |",
-    "+------------------------------+",
-    `Bot: ${settings.botName || "BOT"}`,
-    `Owner: ${settings.ownerName || "Owner"}`,
-    `Prefijos: ${prefixLabel}`,
-    `Uptime: ${uptime}`,
-    `Categorias: ${totalCategories}`,
-    `Comandos: ${totalCommands}`,
+    "╭━━━〔 MENU PRINCIPAL 〕━━━⬣",
+    `┃ ✦ Bot: *${settings.botName || "BOT"}*`,
+    `┃ ✦ Owner: *${settings.ownerName || "Owner"}*`,
+    `┃ ✦ Prefijos: *${prefixLabel}*`,
+    `┃ ✦ Uptime: *${uptime}*`,
+    `┃ ✦ Categorias: *${totalCategories}*`,
+    `┃ ✦ Comandos: *${totalCommands}*`,
+    "╰━━━━━━━━━━━━━━━━━━━━━━⬣",
   ].join("\n");
 }
 
@@ -92,8 +72,9 @@ function buildCategoryBlock(category, commands, primaryPrefix) {
   const icon = getCategoryIcon(category);
   const title = normalizeCategoryLabel(category);
   const lines = [
-    `${icon} ${title}`,
-    ...commands.map((name) => `- ${primaryPrefix}${name}`),
+    `╭─〔 ${icon} ${title} 〕`,
+    ...commands.map((name) => `│ • \`${primaryPrefix}${name}\``),
+    "╰────────────⬣",
   ];
 
   return lines.join("\n");
@@ -101,46 +82,25 @@ function buildCategoryBlock(category, commands, primaryPrefix) {
 
 function buildFooter(primaryPrefix) {
   return [
-    "[ NOTAS ]",
-    `- Usa ${primaryPrefix}status para ver el estado del bot`,
-    `- Usa ${primaryPrefix}owner si necesitas soporte directo`,
-  ].join("\n");
-}
-
-function buildCategorySelectionText({ category, commands, primaryPrefix, settings }) {
-  return [
-    "MENU PRINCIPAL",
-    "",
-    `Bot: ${settings.botName || "Fsociety bot"}`,
-    `Categoria: ${category}`,
-    "",
-    "Comandos disponibles:",
-    ...commands.map((name) => `- ${primaryPrefix}${name}`),
+    "╭─〔 NOTAS 〕",
+    `│ • Usa \`${primaryPrefix}status\` para ver el estado del bot`,
+    `│ • Usa \`${primaryPrefix}owner\` si necesitas soporte directo`,
+    "╰────────────⬣",
   ].join("\n");
 }
 
 function resolveMenuImagePath() {
   const base = path.join(process.cwd(), "imagenes", "menu");
   const candidates = [`${base}.png`, `${base}.jpg`, `${base}.jpeg`, `${base}.webp`];
-
-  for (const filePath of candidates) {
-    try {
-      if (fs.existsSync(filePath) && fs.statSync(filePath).size > 128) {
-        return filePath;
-      }
-    } catch {}
-  }
-
-  return "";
+  return candidates.find((filePath) => fs.existsSync(filePath)) || "";
 }
 
 export default {
-  name: "menu",
   command: ["menu"],
   category: "menu",
-  description: "Menu principal con soporte por categoria",
+  description: "Menu principal con imagen",
 
-  run: async ({ sock, msg, from, settings, comandos, args = [] }) => {
+  run: async ({ sock, msg, from, settings, comandos }) => {
     try {
       if (!comandos) {
         return sock.sendMessage(
@@ -150,44 +110,31 @@ export default {
         );
       }
 
-      const primaryPrefix = getPrimaryPrefix(settings);
-      const prefixLabel = getPrefixLabel(settings);
-      const categorias = buildCategoryMap(comandos);
-      const requestedCategory = String(args?.[0] || "")
-        .trim()
-        .toLowerCase();
-
-      if (requestedCategory) {
-        const commands = Array.from(categorias[requestedCategory] || []).sort();
-
-        if (!commands.length) {
-          return sock.sendMessage(
-            from,
-            {
-              text: `No encontre la categoria "${requestedCategory}".`,
-              ...global.channelInfo,
-            },
-            { quoted: msg }
-          );
-        }
-
+      const imagePath = resolveMenuImagePath();
+      if (!imagePath) {
         return sock.sendMessage(
           from,
-          {
-            text: buildCategorySelectionText({
-              category: requestedCategory,
-              commands,
-              primaryPrefix,
-              settings,
-            }),
-            ...global.channelInfo,
-          },
+          { text: "Imagen del menu no encontrada en imagenes/menu.png.", ...global.channelInfo },
           { quoted: msg }
         );
       }
 
-      const imagePath = resolveMenuImagePath();
       const uptime = formatUptime(process.uptime());
+      const primaryPrefix = getPrimaryPrefix(settings);
+      const prefixLabel = getPrefixLabel(settings);
+      const categorias = {};
+
+      for (const cmd of new Set(comandos.values())) {
+        if (!cmd?.category || !cmd?.command) continue;
+
+        const category = String(cmd.category).toLowerCase();
+        const principal = cmd.name || (Array.isArray(cmd.command) ? cmd.command[0] : cmd.command);
+        if (!principal) continue;
+
+        if (!categorias[category]) categorias[category] = new Set();
+        categorias[category].add(String(principal).toLowerCase());
+      }
+
       const categoryNames = Object.keys(categorias).sort();
       const totalCommands = categoryNames.reduce(
         (sum, category) => sum + Array.from(categorias[category]).length,
@@ -208,19 +155,15 @@ export default {
         buildFooter(primaryPrefix),
       ];
 
-      const payload = {
-        caption: parts.join("\n\n").trim(),
-        ...global.channelInfo,
-      };
-
-      if (imagePath) {
-        payload.image = fs.readFileSync(imagePath);
-      } else {
-        payload.text = payload.caption;
-        delete payload.caption;
-      }
-
-      await sock.sendMessage(from, payload, { quoted: msg });
+      await sock.sendMessage(
+        from,
+        {
+          image: fs.readFileSync(imagePath),
+          caption: parts.join("\n\n").trim(),
+          ...global.channelInfo,
+        },
+        { quoted: msg }
+      );
     } catch (error) {
       console.error("MENU ERROR:", error);
       await sock.sendMessage(
