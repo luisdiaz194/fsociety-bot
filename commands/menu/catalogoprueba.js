@@ -10,6 +10,14 @@ function formatUptime(seconds) {
   return `${h}h ${m}m ${s}s`;
 }
 
+function getPrimaryPrefix(settings) {
+  if (Array.isArray(settings?.prefix)) {
+    return settings.prefix.find((value) => String(value || "").trim()) || ".";
+  }
+
+  return String(settings?.prefix || ".").trim() || ".";
+}
+
 function buildCategoryMap(comandos) {
   const categories = {};
 
@@ -20,34 +28,23 @@ function buildCategoryMap(comandos) {
     const commandName = cmd.name || (Array.isArray(cmd.command) ? cmd.command[0] : cmd.command);
     if (!category || !commandName) continue;
 
-    if (!categories[category]) {
-      categories[category] = new Set();
-    }
-
+    if (!categories[category]) categories[category] = new Set();
     categories[category].add(String(commandName || "").trim().toLowerCase());
   }
 
   return categories;
 }
 
-function getPrimaryPrefix(settings) {
-  if (Array.isArray(settings?.prefix)) {
-    return settings.prefix.find((value) => String(value || "").trim()) || ".";
-  }
-
-  return String(settings?.prefix || ".").trim() || ".";
-}
-
 function buildRows(categories, prefix) {
   const rows = [
     {
       title: "Menu completo",
-      description: "Abrir el menu general del bot",
+      description: "Mostrar todo el menu del bot",
       id: `${prefix}menu`,
     },
     {
       title: "Estado del bot",
-      description: "Ver estado general y uptime",
+      description: "Ver uptime y estado general",
       id: `${prefix}status`,
     },
     {
@@ -61,18 +58,78 @@ function buildRows(categories, prefix) {
     rows.push({
       title: `Categoria: ${category}`,
       description: `Ver comandos de ${category}`,
-      id: `${prefix}catalogook ${category}`,
+      id: `${prefix}menu ${category}`,
     });
   }
 
   return rows;
 }
 
+function resolveHeaderMedia() {
+  const videoBase = path.join(process.cwd(), "videos", "menu-video");
+  const imageBase = path.join(process.cwd(), "imagenes", "menu");
+  const candidates = [
+    `${videoBase}.mp4`,
+    `${videoBase}.mov`,
+    `${imageBase}.png`,
+    `${imageBase}.jpg`,
+    `${imageBase}.jpeg`,
+    `${imageBase}.webp`,
+  ];
+
+  for (const filePath of candidates) {
+    try {
+      if (fs.existsSync(filePath) && fs.statSync(filePath).size > 128) {
+        return filePath;
+      }
+    } catch {}
+  }
+
+  return "";
+}
+
+async function buildHeader(sock) {
+  const mediaPath = resolveHeaderMedia();
+  const header = {
+    title: "MENU PRINCIPAL",
+    hasMediaAttachment: false,
+  };
+
+  if (!mediaPath) return header;
+
+  const isVideo = /\.(mp4|mov)$/i.test(mediaPath);
+  const media = await prepareWAMessageMedia(
+    isVideo
+      ? {
+          video: fs.readFileSync(mediaPath),
+          gifPlayback: false,
+        }
+      : {
+          image: fs.readFileSync(mediaPath),
+        },
+    { upload: sock.waUploadToServer }
+  );
+
+  if (isVideo) {
+    return {
+      title: "MENU PRINCIPAL",
+      hasMediaAttachment: true,
+      videoMessage: media.videoMessage,
+    };
+  }
+
+  return {
+    title: "MENU PRINCIPAL",
+    hasMediaAttachment: true,
+    imageMessage: media.imageMessage,
+  };
+}
+
 export default {
   name: "catalogoprueba",
   command: ["catalogoprueba", "catalogotest", "menulista"],
   category: "menu",
-  description: "Prueba de catalogo interactivo tipo native flow",
+  description: "Prueba de catalogo native flow",
 
   run: async ({ sock, msg, from, settings, comandos }) => {
     try {
@@ -80,36 +137,14 @@ export default {
       const uptime = formatUptime(process.uptime());
       const categories = buildCategoryMap(comandos);
       const rows = buildRows(categories, prefix);
-      const videoPath = path.join(process.cwd(), "videos", "menu-video.mp4");
-
-      let header = {
-        title: "MENU PRINCIPAL",
-        hasMediaAttachment: false,
-      };
-
-      if (fs.existsSync(videoPath)) {
-        const media = await prepareWAMessageMedia(
-          {
-            video: fs.readFileSync(videoPath),
-          },
-          {
-            upload: sock.waUploadToServer,
-          }
-        );
-
-        header = {
-          title: "MENU PRINCIPAL",
-          hasMediaAttachment: true,
-          videoMessage: media.videoMessage,
-        };
-      }
+      const header = await buildHeader(sock);
 
       const interactiveMessage = {
         body: {
           text:
-            `MENU PRINCIPAL\n` +
-            `[ MENU ]\n` +
-            `LABORATORIO DE COMANDOS\n` +
+            "MENU PRINCIPAL\n" +
+            "[ MENU ]\n" +
+            "LABORATORIO DE COMANDOS\n" +
             `Bot: ${settings?.botName || "Fsociety bot"}\n` +
             `Hora: ${new Date().toLocaleTimeString("es-PE", {
               hour: "2-digit",
@@ -118,7 +153,7 @@ export default {
               hour12: false,
             })}\n` +
             `Uptime: ${uptime}\n\n` +
-            `Elige una categoria`,
+            "Elige una categoria",
         },
         footer: {
           text: "Fsociety bot",
@@ -153,7 +188,7 @@ export default {
           },
         },
         {
-          userJid: sock.user?.id,
+          userJid: sock.user?.id || sock.user?.jid,
           quoted: msg,
         }
       );

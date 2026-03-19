@@ -768,6 +768,71 @@ function obtenerTexto(message) {
   const msg = normalizeMessageContent(message);
   let interactiveSelectedId = "";
 
+  function extractSelectedId(value) {
+    if (!value) return "";
+
+    if (typeof value === "string") {
+      const trimmed = value.trim();
+      if (!trimmed) return "";
+
+      if (
+        (trimmed.startsWith("{") && trimmed.endsWith("}")) ||
+        (trimmed.startsWith("[") && trimmed.endsWith("]"))
+      ) {
+        try {
+          return extractSelectedId(JSON.parse(trimmed));
+        } catch {}
+      }
+
+      return "";
+    }
+
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        const selectedId = extractSelectedId(item);
+        if (selectedId) return selectedId;
+      }
+      return "";
+    }
+
+    if (typeof value === "object") {
+      const directKeys = [
+        "id",
+        "selectedId",
+        "selectedID",
+        "selectedRowId",
+        "selected_row_id",
+        "selectedButtonId",
+        "selected_button_id",
+        "selectedItemId",
+        "selected_item_id",
+      ];
+
+      for (const key of directKeys) {
+        const selectedId = String(value?.[key] || "").trim();
+        if (selectedId) return selectedId;
+      }
+
+      const nestedKeys = [
+        "singleSelectReply",
+        "single_select_reply",
+        "listResponse",
+        "list_response",
+        "response_json",
+        "buttonParamsJson",
+        "paramsJson",
+        "nativeFlowResponseMessage",
+      ];
+
+      for (const key of nestedKeys) {
+        const selectedId = extractSelectedId(value?.[key]);
+        if (selectedId) return selectedId;
+      }
+    }
+
+    return "";
+  }
+
   try {
     const rawParams =
       msg?.interactiveResponseMessage?.nativeFlowResponseMessage?.paramsJson ||
@@ -775,18 +840,7 @@ function obtenerTexto(message) {
       "";
 
     if (rawParams) {
-      const parsed = JSON.parse(rawParams);
-      interactiveSelectedId =
-        parsed?.id ||
-        parsed?.selectedId ||
-        parsed?.selectedRowId ||
-        parsed?.selected_row_id ||
-        parsed?.singleSelectReply?.selectedRowId ||
-        parsed?.single_select_reply?.selected_row_id ||
-        parsed?.listResponse?.singleSelectReply?.selectedRowId ||
-        parsed?.list_response?.single_select_reply?.selected_row_id ||
-        parsed?.response_json?.id ||
-        "";
+      interactiveSelectedId = extractSelectedId(rawParams);
     }
   } catch {}
 
@@ -796,12 +850,12 @@ function obtenerTexto(message) {
     msg?.imageMessage?.caption ||
     msg?.videoMessage?.caption ||
     msg?.documentMessage?.caption ||
-    msg?.buttonsResponseMessage?.selectedDisplayText ||
+    interactiveSelectedId ||
     msg?.buttonsResponseMessage?.selectedButtonId ||
     msg?.templateButtonReplyMessage?.selectedId ||
-    msg?.listResponseMessage?.title ||
     msg?.listResponseMessage?.singleSelectReply?.selectedRowId ||
-    interactiveSelectedId ||
+    msg?.buttonsResponseMessage?.selectedDisplayText ||
+    msg?.listResponseMessage?.title ||
     ""
   );
 }
