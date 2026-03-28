@@ -785,7 +785,27 @@ async function convertToMp3(inputPath, outputPath, options = {}) {
   });
 }
 
-async function sendAudioFile(sock, from, quoted, { filePath, fileName, mimetype, title }) {
+async function sendAudioFile(
+  sock,
+  from,
+  quoted,
+  { filePath, fileName, mimetype, title, forceDocument = false }
+) {
+  if (forceDocument || mimetype !== "audio/mpeg") {
+    await sock.sendMessage(
+      from,
+      {
+        document: { url: filePath },
+        mimetype,
+        fileName,
+        caption: `api dvyer\n\n🎵 ${title}`,
+        ...global.channelInfo,
+      },
+      quoted
+    );
+    return "document";
+  }
+
   try {
     await sock.sendMessage(
       from,
@@ -931,6 +951,7 @@ export default {
       let filePathToSend = downloadedAudio.path;
       let fileNameToSend = downloadedAudio.fileName;
       let mimeToSend = downloadedAudio.mimetype;
+      let forceDocument = false;
 
       if (!downloadedAudio.isMp3) {
         try {
@@ -943,6 +964,7 @@ export default {
             "YTMP3 conversion fallback:",
             convertError?.message || convertError
           );
+          forceDocument = true;
         }
       }
 
@@ -952,6 +974,7 @@ export default {
         fileName: fileNameToSend,
         mimetype: mimeToSend,
         title,
+        forceDocument,
       });
     } catch (err) {
       const aborted = abortSignal?.aborted === true;
