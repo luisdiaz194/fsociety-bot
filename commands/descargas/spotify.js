@@ -2,12 +2,13 @@ import fs from "fs";
 import path from "path";
 import os from "os";
 import axios from "axios";
+import yts from "yt-search";
 import { pipeline } from "stream/promises";
+import { bindAbort, buildAbortError, throwIfAborted } from "../../lib/command-abort.js";
 import { chargeDownloadRequest, refundDownloadCharge } from "../economia/download-access.js";
 
 const API_BASE = "https://dv-yer-api.online";
 const API_SPOTIFY_URL = `${API_BASE}/spotify`;
-const API_YTSEARCH_URL = `${API_BASE}/ytsearch`;
 const API_AUDIO_URL = `${API_BASE}/ytdlmp3`;
 
 const COOLDOWN_TIME = 15 * 1000;
@@ -15,6 +16,7 @@ const REQUEST_TIMEOUT = 120000;
 const MAX_AUDIO_BYTES = 120 * 1024 * 1024;
 const AUDIO_AS_DOCUMENT_THRESHOLD = 60 * 1024 * 1024;
 const FALLBACK_AUDIO_QUALITY = "128k";
+const SEARCH_RESULT_LIMIT = 10;
 const TMP_DIR = path.join(os.tmpdir(), "dvyer-spotify");
 
 const cooldowns = new Map();
@@ -70,8 +72,26 @@ function buildAudioMeta(fileName, contentType, fallbackBase = "spotify") {
   };
 }
 
+function getPrefix(settings) {
+  if (Array.isArray(settings?.prefix)) {
+    return settings.prefix.find((value) => String(value || "").trim()) || ".";
+  }
+
+  return String(settings?.prefix || ".").trim() || ".";
+}
+
 function getCooldownRemaining(untilMs) {
   return Math.max(0, Math.ceil((untilMs - Date.now()) / 1000));
+}
+
+function cleanText(value = "") {
+  return String(value || "").replace(/\s+/g, " ").trim();
+}
+
+function clipText(value = "", max = 72) {
+  const normalized = cleanText(value);
+  if (normalized.length <= max) return normalized;
+  return `${normalized.slice(0, Math.max(1, max - 3))}...`;
 }
 
 function extractTextFromMessage(message) {
@@ -116,6 +136,13 @@ function isSpotifyUrl(value) {
   );
 }
 
+function extractYouTubeUrl(text) {
+  const match = String(text || "").match(
+    /https?:\/\/(?:www\.)?(?:youtube\.com|music\.youtube\.com|youtu\.be)\/[^\s]+/i
+  );
+  return match ? match[0].trim() : "";
+}
+
 function buildSpotifyParams(input, mode = "link") {
   const params = {
     mode,
@@ -124,8 +151,11 @@ function buildSpotifyParams(input, mode = "link") {
     lang: "es3",
   };
 
-  if (isSpotifyUrl(input)) params.url = input;
-  else params.q = input;
+  if (isSpotifyUrl(input)) {
+    params.url = input;
+  } else {
+    params.q = input;
+  }
 
   return params;
 }
@@ -173,6 +203,13 @@ function deleteFileSafe(filePath) {
   } catch {}
 }
 
+function getYoutubeAuthorName(video) {
+  return (
+    String(video?.author?.name || video?.author || video?.channel || "")
+      .trim() || "Desconocido"
+  );
+}
+
 async function readStreamToText(stream) {
   return await new Promise((resolve, reject) => {
     let data = "";
@@ -186,10 +223,11 @@ async function readStreamToText(stream) {
   });
 }
 
-async function apiGet(url, params, timeout = REQUEST_TIMEOUT) {
+async function apiGet(url, params, timeout = REQUEST_TIMEOUT, options = {}) {
   const response = await axios.get(url, {
     timeout,
     params,
+    signal: options?.signal || undefined,
     validateStatus: () => true,
   });
 
@@ -206,11 +244,12 @@ async function apiGet(url, params, timeout = REQUEST_TIMEOUT) {
   return data;
 }
 
-async function requestSpotifyInfo(input) {
+async function requestSpotifyInfo(input, options = {}) {
   const data = await apiGet(
     API_SPOTIFY_URL,
     buildSpotifyParams(input, "link"),
-    REQUEST_TIMEOUT
+    REQUEST_TIMEOUT,
+    options
   );
 
   const downloadUrl = normalizeApiUrl(
@@ -218,75 +257,215 @@ async function requestSpotifyInfo(input) {
   );
 
   if (!downloadUrl) {
-    throw new Error("La API no devolvió el enlace de descarga.");
+    throw new Error("La API no devolvio el enlace de descarga.");
   }
 
   return {
     title: safeFileName(data?.title || data?.selected?.title || "spotify"),
-    artist: String(data?.artist || data?.selected?.artist || "").trim() || "Artist",
-    duration: String(data?.duration || data?.selected?.duration || "").trim() || null,
+    artist: cleanText(data?.artist || data?.selected?.artist || "Spotify") || "Spotify",
+    duration: cleanText(data?.duration || data?.selected?.duration || ""),
     thumbnail: data?.thumbnail || data?.selected?.thumbnail || null,
     fileName: normalizeMp3Name(data?.filename || "spotify.mp3"),
     downloadUrl,
   };
 }
 
-async function requestYoutubeFallbackInfo(query) {
-  const searchData = await apiGet(
-    API_YTSEARCH_URL,
-    { q: query, limit: 1 },
-    REQUEST_TIMEOUT
-  );
-
-  const first = searchData?.results?.[0];
-  if (!first?.url) {
-    throw new Error("No encontrÃ© un audio alternativo en YouTube.");
-  }
-
-  const audioData = await apiGet(
+async function requestYoutubeAudioInfo(videoUrl, meta = {}, options = {}) {
+  const data = await apiGet(
     API_AUDIO_URL,
     {
       mode: "link",
       quality: FALLBACK_AUDIO_QUALITY,
-      url: first.url,
+      url: videoUrl,
     },
-    REQUEST_TIMEOUT
+    REQUEST_TIMEOUT,
+    options
   );
 
   const downloadUrl = normalizeApiUrl(
-    audioData?.stream_url_full ||
-      audioData?.download_url_full ||
-      audioData?.stream_url ||
-      audioData?.download_url ||
-      audioData?.url
+    data?.stream_url_full ||
+      data?.download_url_full ||
+      data?.stream_url ||
+      data?.download_url ||
+      data?.url
   );
 
   if (!downloadUrl) {
-    throw new Error("No se pudo preparar el audio alternativo.");
+    throw new Error("No se pudo preparar el audio desde YouTube.");
   }
 
   return {
-    title: safeFileName(audioData?.title || first.title || query || "audio"),
-    artist: String(first?.channel || "YouTube").trim() || "YouTube",
-    thumbnail: first.thumbnail || null,
-    fileName: normalizeMp3Name(audioData?.filename || "audio.mp3"),
+    title: safeFileName(data?.title || meta?.title || "audio"),
+    artist: cleanText(meta?.artist || meta?.author || "YouTube") || "YouTube",
+    duration: cleanText(meta?.duration || ""),
+    thumbnail: meta?.thumbnail || null,
+    fileName: normalizeMp3Name(data?.filename || meta?.title || "audio.mp3"),
     downloadUrl,
   };
 }
 
-async function downloadAudioFromInternalLink(downloadUrl, outputPath, suggestedFileName = "audio.mp3") {
-  const response = await axios.get(downloadUrl, {
-    responseType: "stream",
-    timeout: REQUEST_TIMEOUT,
-    headers: {
-      "User-Agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122 Safari/537.36",
-      Accept: "*/*",
-      Referer: `${API_BASE}/`,
-    },
+async function searchYoutubeResults(query, limit = SEARCH_RESULT_LIMIT) {
+  const result = await yts(query);
+  const videos = Array.isArray(result?.videos) ? result.videos.slice(0, limit) : [];
+
+  if (!videos.length) {
+    throw new Error("No encontre resultados en YouTube.");
+  }
+
+  return videos.map((video) => ({
+    url: String(video?.url || "").trim(),
+    title: clipText(video?.title || "Sin titulo", 72),
+    rawTitle: cleanText(video?.title || "audio") || "audio",
+    duration: cleanText(video?.timestamp || "??:??") || "??:??",
+    author: clipText(getYoutubeAuthorName(video), 42),
+    thumbnail: String(video?.thumbnail || "").trim() || null,
+  }));
+}
+
+async function downloadThumbnailBuffer(url, signal = null) {
+  if (!String(url || "").trim()) return null;
+
+  const response = await axios.get(url, {
+    responseType: "arraybuffer",
+    timeout: 15000,
+    signal,
     validateStatus: () => true,
-    maxRedirects: 5,
   });
+
+  if (response.status >= 400 || !response.data) {
+    return null;
+  }
+
+  return Buffer.from(response.data);
+}
+
+async function sendSpotifySearchPicker(ctx, query, results, options = {}) {
+  const { sock, from, quoted, settings } = ctx;
+  const signal = options?.signal || null;
+  const prefix = getPrefix(settings);
+  const rows = results.map((video, index) => ({
+    header: `${index + 1}`,
+    title: clipText(video.title || "Sin titulo", 72),
+    description: clipText(
+      `🎵 MP3 | ⏱ ${video.duration || "??:??"} | 👤 ${video.author || "Desconocido"}`,
+      72
+    ),
+    id: `${prefix}spotify ${video.url}`,
+  }));
+
+  let thumbBuffer = null;
+  try {
+    thumbBuffer = await downloadThumbnailBuffer(results[0]?.thumbnail, signal);
+  } catch (error) {
+    console.error("SPOTIFY thumb search error:", error?.message || error);
+  }
+
+  const introPayload = thumbBuffer
+    ? {
+        image: thumbBuffer,
+        caption:
+          `🎵 *FSOCIETY BOT*\n\n` +
+          `🔎 Resultado para: *${clipText(query, 80)}*\n` +
+          `📌 Primer resultado: *${clipText(results[0]?.rawTitle || "Sin titulo", 80)}*\n\n` +
+          `Selecciona la cancion que quieres descargar.`,
+      }
+    : {
+        text:
+          `🎵 *FSOCIETY BOT*\n\n` +
+          `🔎 Resultado para: *${clipText(query, 80)}*\n\n` +
+          `Selecciona la cancion que quieres descargar.`,
+      };
+
+  await sock.sendMessage(
+    from,
+    {
+      ...introPayload,
+      ...global.channelInfo,
+    },
+    quoted
+  );
+
+  const interactivePayload = {
+    text: `Resultados para: ${clipText(query, 80)}`,
+    title: "FSOCIETY BOT",
+    subtitle: "Selecciona tu cancion",
+    footer: "Spotify / YouTube audio",
+    interactiveButtons: [
+      {
+        name: "single_select",
+        buttonParamsJson: JSON.stringify({
+          title: "🎵 Descargar audio",
+          sections: [
+            {
+              title: "Resultados",
+              rows,
+            },
+          ],
+        }),
+      },
+    ],
+  };
+
+  try {
+    await sock.sendMessage(
+      from,
+      interactivePayload,
+      quoted
+    );
+  } catch (error) {
+    console.error("SPOTIFY interactive search failed:", error?.message || error);
+
+    const fallbackText = rows
+      .slice(0, 5)
+      .map(
+        (row, index) =>
+          `${index + 1}. ${row.title}\n${prefix}spotify ${results[index]?.url || ""}`
+      )
+      .join("\n\n");
+
+    await sock.sendMessage(
+      from,
+      {
+        text:
+          `Resultados para: ${clipText(query, 80)}\n\n${fallbackText}\n\n` +
+          `Toca o copia uno de los comandos para descargar.`,
+        ...global.channelInfo,
+      },
+      quoted
+    );
+  }
+}
+
+async function downloadAudioFromInternalLink(
+  downloadUrl,
+  outputPath,
+  suggestedFileName = "audio.mp3",
+  options = {}
+) {
+  const signal = options?.signal || null;
+  throwIfAborted(signal);
+
+  let response;
+  try {
+    response = await axios.get(downloadUrl, {
+      responseType: "stream",
+      timeout: REQUEST_TIMEOUT,
+      signal,
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122 Safari/537.36",
+        Accept: "*/*",
+        Referer: `${API_BASE}/`,
+      },
+      validateStatus: () => true,
+      maxRedirects: 5,
+    });
+  } catch (error) {
+    if (signal?.aborted) {
+      throw buildAbortError(signal);
+    }
+    throw error;
+  }
 
   if (response.status >= 400) {
     const errorText = await readStreamToText(response.data).catch(() => "");
@@ -308,16 +487,33 @@ async function downloadAudioFromInternalLink(downloadUrl, outputPath, suggestedF
   response.data.on("data", (chunk) => {
     downloaded += chunk.length;
     if (downloaded > MAX_AUDIO_BYTES) {
-      response.data.destroy(new Error("El audio es demasiado grande para enviarlo por WhatsApp."));
+      response.data.destroy(
+        new Error("El audio es demasiado grande para enviarlo por WhatsApp.")
+      );
     }
   });
 
+  const outputStream = fs.createWriteStream(outputPath);
+  const releaseAbort = bindAbort(signal, () => {
+    const abortError = buildAbortError(signal);
+    response.data?.destroy?.(abortError);
+    outputStream.destroy(abortError);
+    deleteFileSafe(outputPath);
+  });
+
   try {
-    await pipeline(response.data, fs.createWriteStream(outputPath));
+    await pipeline(response.data, outputStream);
   } catch (error) {
     deleteFileSafe(outputPath);
+    if (signal?.aborted) {
+      throw buildAbortError(signal);
+    }
     throw error;
+  } finally {
+    releaseAbort();
   }
+
+  throwIfAborted(signal);
 
   if (!fs.existsSync(outputPath)) {
     throw new Error("No se pudo guardar el audio.");
@@ -326,7 +522,7 @@ async function downloadAudioFromInternalLink(downloadUrl, outputPath, suggestedF
   const size = fs.statSync(outputPath).size;
   if (!size || size < 50000) {
     deleteFileSafe(outputPath);
-    throw new Error("El audio descargado es inválido.");
+    throw new Error("El audio descargado es invalido.");
   }
 
   if (size > MAX_AUDIO_BYTES) {
@@ -351,7 +547,14 @@ async function downloadAudioFromInternalLink(downloadUrl, outputPath, suggestedF
   };
 }
 
-async function sendSpotifyAudio(sock, from, quoted, { filePath, fileName, mimetype, title, artist, size, sourceLabel }) {
+async function sendSpotifyAudio(
+  sock,
+  from,
+  quoted,
+  { filePath, fileName, mimetype, title, artist, size }
+) {
+  const artistLabel = cleanText(artist || "Spotify") || "Spotify";
+
   if (size > AUDIO_AS_DOCUMENT_THRESHOLD) {
     await sock.sendMessage(
       from,
@@ -359,7 +562,7 @@ async function sendSpotifyAudio(sock, from, quoted, { filePath, fileName, mimety
         document: { url: filePath },
         mimetype,
         fileName,
-        caption: `api dvyer\n\n🎵 ${title}\n🎤 ${artist}\n📦 Enviado como documento`,
+        caption: `api dvyer\n\n🎵 ${title}\n🎤 ${artistLabel}\n📦 Enviado como documento`,
         ...global.channelInfo,
       },
       quoted
@@ -383,15 +586,15 @@ async function sendSpotifyAudio(sock, from, quoted, { filePath, fileName, mimety
     await sock.sendMessage(
       from,
       {
-        text: `api dvyer\n\n🎵 ${title}\n🎤 ${artist}`,
+        text: `api dvyer\n\n🎵 ${title}\n🎤 ${artistLabel}`,
         ...global.channelInfo,
       },
       quoted
     );
 
     return "audio";
-  } catch (e1) {
-    console.error("send spotify audio failed:", e1?.message || e1);
+  } catch (error) {
+    console.error("send spotify audio failed:", error?.message || error);
 
     await sock.sendMessage(
       from,
@@ -399,7 +602,7 @@ async function sendSpotifyAudio(sock, from, quoted, { filePath, fileName, mimety
         document: { url: filePath },
         mimetype,
         fileName,
-        caption: `api dvyer\n\n🎵 ${title}\n🎤 ${artist}\n📦 Enviado como documento`,
+        caption: `api dvyer\n\n🎵 ${title}\n🎤 ${artistLabel}\n📦 Enviado como documento`,
         ...global.channelInfo,
       },
       quoted
@@ -413,9 +616,10 @@ export default {
   category: "descarga",
 
   run: async (ctx) => {
-    const { sock, from } = ctx;
+    const { sock, from, settings } = ctx;
     const msg = ctx.m || ctx.msg || null;
     const quoted = msg?.key ? { quoted: msg } : undefined;
+    const abortSignal = ctx.abortSignal || null;
     const userId = `${from}:spotify`;
 
     let tempPath = null;
@@ -423,10 +627,14 @@ export default {
 
     const until = cooldowns.get(userId);
     if (until && until > Date.now()) {
-      return sock.sendMessage(from, {
-        text: `⏳ Espera ${getCooldownRemaining(until)}s`,
-        ...global.channelInfo,
-      });
+      return sock.sendMessage(
+        from,
+        {
+          text: `⏳ Espera ${getCooldownRemaining(until)}s`,
+          ...global.channelInfo,
+        },
+        quoted
+      );
     }
 
     cooldowns.set(userId, Date.now() + COOLDOWN_TIME);
@@ -436,10 +644,40 @@ export default {
 
       if (!userInput) {
         cooldowns.delete(userId);
-        return sock.sendMessage(from, {
-          text: "❌ Uso: .spotify <canción, artista o url de Spotify>",
-          ...global.channelInfo,
-        });
+        return sock.sendMessage(
+          from,
+          {
+            text: "❌ Uso: .spotify <cancion, url de Spotify o url de YouTube>",
+            ...global.channelInfo,
+          },
+          quoted
+        );
+      }
+
+      throwIfAborted(abortSignal);
+
+      const spotifyUrl = isSpotifyUrl(userInput);
+      const youtubeUrl = extractYouTubeUrl(userInput);
+      const plainQuery = !spotifyUrl && !youtubeUrl;
+
+      if (plainQuery) {
+        try {
+          const results = await searchYoutubeResults(userInput, SEARCH_RESULT_LIMIT);
+          throwIfAborted(abortSignal);
+          await sendSpotifySearchPicker(
+            { sock, from, quoted, settings },
+            userInput,
+            results,
+            { signal: abortSignal }
+          );
+          cooldowns.delete(userId);
+          return;
+        } catch (searchError) {
+          if (abortSignal?.aborted) {
+            throw buildAbortError(abortSignal);
+          }
+          console.warn("SPOTIFY search picker fallback:", searchError?.message || searchError);
+        }
       }
 
       downloadCharge = await chargeDownloadRequest(ctx, {
@@ -451,23 +689,48 @@ export default {
         return;
       }
 
+      const preparingText = spotifyUrl
+        ? `🎵 Preparando audio desde Spotify...\n\n🌐 ${API_BASE}`
+        : youtubeUrl
+          ? `🎵 Preparando audio desde YouTube...\n\n🌐 ${API_BASE}`
+          : `🎵 Buscando en Spotify...\n\n🌐 ${API_BASE}\n🔎 ${userInput}`;
+
       await sock.sendMessage(
         from,
         {
-          text: `🎵 Buscando en Spotify...\n\n🌐 ${API_BASE}\n🔎 ${userInput}`,
+          text: preparingText,
           ...global.channelInfo,
         },
         quoted
       );
 
-      const info = await requestSpotifyInfo(userInput);
+      let info = null;
+      let artistLabel = "Spotify";
+      let fallbackQuery = userInput;
+
+      if (spotifyUrl || plainQuery) {
+        info = await requestSpotifyInfo(userInput, { signal: abortSignal });
+        artistLabel = info.artist;
+        fallbackQuery = `${info.title} ${info.artist}`.trim() || userInput;
+      } else {
+        info = await requestYoutubeAudioInfo(
+          youtubeUrl,
+          {
+            artist: "YouTube",
+          },
+          { signal: abortSignal }
+        );
+        artistLabel = `${info.artist} (YouTube)`;
+      }
 
       if (info.thumbnail) {
         await sock.sendMessage(
           from,
           {
             image: { url: info.thumbnail },
-            caption: `api dvyer\n\n🎵 ${info.title}\n🎤 ${info.artist}${info.duration ? `\n⏱️ ${info.duration}` : ""}`,
+            caption:
+              `api dvyer\n\n🎵 ${info.title}\n🎤 ${artistLabel}` +
+              `${info.duration ? `\n⏱️ ${info.duration}` : ""}`,
             ...global.channelInfo,
           },
           quoted
@@ -476,15 +739,19 @@ export default {
 
       tempPath = path.join(TMP_DIR, `${Date.now()}-${info.fileName}`);
       let downloaded = null;
-      let sourceLabel = "Spotify";
 
       try {
         downloaded = await downloadAudioFromInternalLink(
           info.downloadUrl,
           tempPath,
-          info.fileName
+          info.fileName,
+          { signal: abortSignal }
         );
       } catch (primaryError) {
+        if (!spotifyUrl && !plainQuery) {
+          throw primaryError;
+        }
+
         deleteFileSafe(tempPath);
         tempPath = null;
 
@@ -493,47 +760,72 @@ export default {
         await sock.sendMessage(
           from,
           {
-            text: "âš ï¸ Spotify directo fallÃ³. Intento con tu ruta de audio por YouTube...",
-            ...global.channelInfo,
             text: "Spotify directo fallo. Intento con tu ruta de audio por YouTube...",
+            ...global.channelInfo,
           },
           quoted
         );
 
-        const fallbackInfo = await requestYoutubeFallbackInfo(
-          `${info.title} ${info.artist}`.trim()
+        const fallbackResults = await searchYoutubeResults(fallbackQuery, 1);
+        const firstVideo = fallbackResults[0];
+
+        if (!firstVideo?.url) {
+          throw new Error("No encontre un audio alternativo en YouTube.");
+        }
+
+        const fallbackInfo = await requestYoutubeAudioInfo(
+          firstVideo.url,
+          {
+            title: firstVideo.rawTitle,
+            artist: firstVideo.author,
+            duration: firstVideo.duration,
+            thumbnail: firstVideo.thumbnail,
+          },
+          { signal: abortSignal }
         );
 
-        sourceLabel = "Fallback YouTube";
+        info = fallbackInfo;
+        artistLabel = `${fallbackInfo.artist} (YouTube)`;
         tempPath = path.join(TMP_DIR, `${Date.now()}-${fallbackInfo.fileName}`);
         downloaded = await downloadAudioFromInternalLink(
           fallbackInfo.downloadUrl,
           tempPath,
-          fallbackInfo.fileName
+          fallbackInfo.fileName,
+          { signal: abortSignal }
         );
       }
+
+      throwIfAborted(abortSignal);
 
       await sendSpotifyAudio(sock, from, quoted, {
         filePath: downloaded.tempPath,
         fileName: downloaded.fileName,
         mimetype: downloaded.mimetype,
         title: info.title,
-        artist: sourceLabel === "Spotify" ? info.artist : `${info.artist} (${sourceLabel})`,
+        artist: artistLabel,
         size: downloaded.size,
-        sourceLabel,
       });
-    } catch (err) {
-      console.error("SPOTIFY ERROR:", err?.message || err);
+    } catch (error) {
+      const aborted = abortSignal?.aborted === true;
+      console.error("SPOTIFY ERROR:", error?.message || error);
       refundDownloadCharge(ctx, downloadCharge, {
         feature: "spotify",
-        error: String(err?.message || err || "unknown_error"),
+        error: String(error?.message || error || "unknown_error"),
       });
       cooldowns.delete(userId);
 
-      await sock.sendMessage(from, {
-        text: `❌ ${String(err?.message || "No se pudo procesar la canción.")}`,
-        ...global.channelInfo,
-      });
+      if (aborted) {
+        return;
+      }
+
+      await sock.sendMessage(
+        from,
+        {
+          text: `❌ ${String(error?.message || "No se pudo procesar la cancion.")}`,
+          ...global.channelInfo,
+        },
+        quoted
+      );
     } finally {
       deleteFileSafe(tempPath);
     }
