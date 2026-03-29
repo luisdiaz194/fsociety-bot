@@ -2,13 +2,24 @@ import fs from "fs";
 import path from "path";
 import os from "os";
 import axios from "axios";
+import crypto from "crypto";
 import { pipeline } from "stream/promises";
 import { spawn } from "child_process";
 import { bindAbort, buildAbortError, throwIfAborted } from "../../lib/command-abort.js";
 import { chargeDownloadRequest, refundDownloadCharge } from "../economia/download-access.js";
 
-const API_BASE = "https://dv-yer-api.online";
-const API_SPOTIFY_URL = `${API_BASE}/spotify`;
+const SPOTIFY_WEB_BASE = "https://open.spotify.com";
+const SPOTIFY_SERVER_TIME_URL = `${SPOTIFY_WEB_BASE}/api/server-time`;
+const SPOTIFY_TOKEN_URL = `${SPOTIFY_WEB_BASE}/api/token`;
+const SPOTIFY_PATHFINDER_URL = "https://api-partner.spotify.com/pathfinder/v1/query";
+const SPOTIFY_SEARCH_HASH = "9755dacab35115e202b377eac0c70846b9dfc76a4f6944398e8a79750d40ed4d";
+const SPOTIFY_TRACK_HASH = "cc31bfe16d74df1e9f6f880a908bb3880674deca34c8b67576ecbf8246e967ba";
+const SPOTIFY_TOKEN_EARLY_REFRESH_MS = 30000;
+const SPOTIFY_TOTP_PROFILES = [
+  { version: "61", secret: ',7/*F("rLJ2oxaKL^f+E1xvP@N' },
+  { version: "60", secret: 'OmE{ZA.J^":0FG\\Uz?[@WW' },
+  { version: "59", secret: "{iOFn;4}<1PFYKPV?5{%u14]M>/V0hDH" },
+];
 
 const COOLDOWN_TIME = 15 * 1000;
 const REQUEST_TIMEOUT = 120000;
@@ -19,6 +30,10 @@ const SEARCH_RESULT_LIMIT = 10;
 const TMP_DIR = path.join(os.tmpdir(), "dvyer-spotify");
 
 const cooldowns = new Map();
+let spotifyTokenCache = {
+  token: "",
+  expiresAt: 0,
+};
 
 if (!fs.existsSync(TMP_DIR)) {
   fs.mkdirSync(TMP_DIR, { recursive: true });
@@ -176,6 +191,23 @@ function isSpotifyUrl(value) {
   );
 }
 
+function extractSpotifyEntityType(value) {
+  const text = String(value || "").trim();
+  if (!text) return "";
+
+  const uriMatch = text.match(/^spotify:([a-z]+):/i);
+  if (uriMatch?.[1]) {
+    return String(uriMatch[1]).toLowerCase();
+  }
+
+  const urlMatch = text.match(/open\.spotify\.com\/(?:intl-[^/]+\/)?([a-z]+)\//i);
+  if (urlMatch?.[1]) {
+    return String(urlMatch[1]).toLowerCase();
+  }
+
+  return "";
+}
+
 function isHttpUrl(value) {
   return /^https?:\/\//i.test(String(value || "").trim());
 }
@@ -212,27 +244,417 @@ function parseSpotifySelectionInput(value) {
   };
 }
 
-function buildSpotifyParams(input, options = {}) {
-  const mode = String(options?.mode || "link").trim().toLowerCase() || "link";
-  const pick = Math.max(1, Math.min(20, Number(options?.pick || 1)));
-  const limit = Math.max(1, Math.min(20, Number(options?.limit || SEARCH_RESULT_LIMIT)));
-  const lang = String(options?.lang || "es3").trim().toLowerCase() || "es3";
-  const cleanedInput = String(input || "").trim();
+function formatDurationFromMs(value) {
+  const totalSeconds = Math.floor(Number(value || 0) / 1000);
+  if (!Number.isFinite(totalSeconds) || totalSeconds <= 0) return "??:??";
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = String(totalSeconds % 60).padStart(2, "0");
+  return `${minutes}:${seconds}`;
+}
 
-  const params = {
-    mode,
-    pick,
-    limit,
-    lang,
+function decodeSpotifyTotpSecret(secret) {
+  const transformed = String(secret || "")
+    .split("")
+    .map((char, index) => char.charCodeAt(0) ^ ((index % 33) + 9))
+    .join("");
+  return Buffer.from(transformed, "utf8");
+}
+
+function generateSpotifyTotp(secretBuffer, timestampMs = Date.now()) {
+  const counter = BigInt(Math.floor(Number(timestampMs || Date.now()) / 1000 / 30));
+  const counterBuffer = Buffer.alloc(8);
+  counterBuffer.writeBigUInt64BE(counter);
+
+  const digest = crypto.createHmac("sha1", secretBuffer).update(counterBuffer).digest();
+  const offset = digest[digest.length - 1] & 0x0f;
+  const binaryCode =
+    ((digest[offset] & 0x7f) << 24) |
+    ((digest[offset + 1] & 0xff) << 16) |
+    ((digest[offset + 2] & 0xff) << 8) |
+    (digest[offset + 3] & 0xff);
+  return String(binaryCode % 1_000_000).padStart(6, "0");
+}
+
+function buildSpotifyWebHeaders(accessToken = "") {
+  const headers = {
+    Accept: "application/json, text/plain, */*",
+    "Content-Type": "application/json",
+    "User-Agent":
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36",
+    Origin: SPOTIFY_WEB_BASE,
+    Referer: `${SPOTIFY_WEB_BASE}/`,
+    "app-platform": "WebPlayer",
   };
 
-  if (isSpotifyUrl(cleanedInput)) {
-    params.url = cleanedInput;
-  } else {
-    params.q = cleanedInput;
+  if (accessToken) {
+    headers.Authorization = `Bearer ${accessToken}`;
   }
 
-  return params;
+  return headers;
+}
+
+async function fetchSpotifyServerTime(signal = null) {
+  const response = await axios.get(SPOTIFY_SERVER_TIME_URL, {
+    timeout: 10000,
+    signal,
+    headers: buildSpotifyWebHeaders(),
+    validateStatus: () => true,
+  });
+
+  if (response.status >= 400) return null;
+  const serverTime = Number(response.data?.serverTime);
+  if (!Number.isFinite(serverTime) || serverTime <= 0) return null;
+  return serverTime;
+}
+
+async function requestNewSpotifyToken(options = {}) {
+  const signal = options?.signal || null;
+  const serverTimeSeconds = await fetchSpotifyServerTime(signal).catch(() => null);
+  let lastError = null;
+
+  for (const profile of SPOTIFY_TOTP_PROFILES) {
+    const secretBuffer = decodeSpotifyTotpSecret(profile.secret);
+    const nowMs = Date.now();
+    const params = {
+      reason: "init",
+      productType: "web_player",
+      totp: generateSpotifyTotp(secretBuffer, nowMs),
+      totpServer: Number.isFinite(serverTimeSeconds)
+        ? generateSpotifyTotp(secretBuffer, Number(serverTimeSeconds) * 1000)
+        : "unavailable",
+      totpVer: String(profile.version),
+    };
+
+    const response = await axios.get(SPOTIFY_TOKEN_URL, {
+      timeout: 15000,
+      signal,
+      params,
+      headers: buildSpotifyWebHeaders(),
+      validateStatus: () => true,
+    });
+
+    if (response.status >= 400 || !response.data?.accessToken) {
+      lastError = extractApiError(response.data, response.status);
+      continue;
+    }
+
+    const expiresAt = Number(response.data?.accessTokenExpirationTimestampMs || 0);
+    spotifyTokenCache = {
+      token: String(response.data.accessToken),
+      expiresAt: expiresAt > 0 ? expiresAt - SPOTIFY_TOKEN_EARLY_REFRESH_MS : Date.now() + 5 * 60 * 1000,
+    };
+    return spotifyTokenCache.token;
+  }
+
+  throw new Error(
+    cleanText(lastError) || "Spotify rechazo la autorizacion web temporal. Intenta de nuevo en unos segundos."
+  );
+}
+
+async function getSpotifyAccessToken(options = {}) {
+  if (!options?.forceRefresh && spotifyTokenCache.token && spotifyTokenCache.expiresAt > Date.now()) {
+    return spotifyTokenCache.token;
+  }
+  return await requestNewSpotifyToken(options);
+}
+
+async function spotifyPathfinderQuery(operationName, variables, hash, options = {}) {
+  const signal = options?.signal || null;
+  let token = await getSpotifyAccessToken({ signal, forceRefresh: Boolean(options?.forceRefresh) });
+
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const response = await axios.post(
+      SPOTIFY_PATHFINDER_URL,
+      {
+        operationName,
+        variables,
+        extensions: {
+          persistedQuery: {
+            version: 1,
+            sha256Hash: hash,
+          },
+        },
+      },
+      {
+        timeout: REQUEST_TIMEOUT,
+        signal,
+        headers: buildSpotifyWebHeaders(token),
+        validateStatus: () => true,
+      }
+    );
+
+    if ((response.status === 401 || response.status === 403 || response.status === 429) && attempt === 0) {
+      spotifyTokenCache = { token: "", expiresAt: 0 };
+      token = await getSpotifyAccessToken({ signal, forceRefresh: true });
+      continue;
+    }
+
+    if (response.status >= 400) {
+      throw new Error(extractApiError(response.data, response.status));
+    }
+
+    if (Array.isArray(response.data?.errors) && response.data.errors.length) {
+      const firstError = cleanText(response.data.errors[0]?.message || "Spotify devolvio un error.");
+      throw new Error(firstError || "Spotify devolvio un error.");
+    }
+
+    return response.data;
+  }
+
+  throw new Error("No se pudo completar la consulta a Spotify.");
+}
+
+function pickBestImageUrl(sources = []) {
+  const list = Array.isArray(sources) ? sources : [];
+  const sorted = [...list].sort((left, right) => Number(right?.width || 0) - Number(left?.width || 0));
+  return String(sorted[0]?.url || "").trim() || null;
+}
+
+function extractTrackIdFromValue(value) {
+  const text = String(value || "").trim();
+  if (!text) return "";
+
+  const uriMatch = text.match(/spotify:track:([A-Za-z0-9]{22})/i);
+  if (uriMatch?.[1]) return uriMatch[1];
+
+  const urlMatch = text.match(/\/track\/([A-Za-z0-9]{22})/i);
+  if (urlMatch?.[1]) return urlMatch[1];
+
+  const rawIdMatch = text.match(/^([A-Za-z0-9]{22})$/);
+  if (rawIdMatch?.[1]) return rawIdMatch[1];
+
+  return "";
+}
+
+function buildSpotifyTrackUri(trackId) {
+  return `spotify:track:${trackId}`;
+}
+
+function buildSpotifyTrackUrl(trackId) {
+  return `${SPOTIFY_WEB_BASE}/track/${trackId}`;
+}
+
+function formatArtistNames(items = []) {
+  const names = (Array.isArray(items) ? items : [])
+    .map((item) => cleanText(item?.profile?.name || item?.name || ""))
+    .filter(Boolean);
+
+  return names.join(", ") || "Spotify";
+}
+
+function normalizeSpotifySearchResults(items = []) {
+  return (Array.isArray(items) ? items : [])
+    .map((entry, index) => {
+      const track = entry?.item?.data || entry?.data || entry || {};
+      const trackId = extractTrackIdFromValue(track?.uri || track?.id || "");
+      if (!trackId) return null;
+
+      const title = cleanText(track?.name || "spotify") || "spotify";
+      const artist = formatArtistNames(track?.artists?.items);
+      const thumbnail = pickBestImageUrl(track?.albumOfTrack?.coverArt?.sources);
+
+      return {
+        index: index + 1,
+        trackId,
+        title: clipText(title, 72),
+        rawTitle: title,
+        artist: clipText(artist, 42),
+        rawArtist: artist,
+        duration: "??:??",
+        thumbnail,
+        spotifyUrl: buildSpotifyTrackUrl(trackId),
+        fileName: normalizeMp3Name(`${title} - ${artist}`),
+      };
+    })
+    .filter(Boolean);
+}
+
+async function resolveSpotifyTrackId(input, options = {}) {
+  const signal = options?.signal || null;
+  const directTrackId = extractTrackIdFromValue(input);
+  if (directTrackId) return directTrackId;
+
+  const text = String(input || "").trim();
+  if (!/spotify\.link\//i.test(text)) {
+    return "";
+  }
+
+  const response = await axios.get(text, {
+    timeout: 15000,
+    maxRedirects: 5,
+    signal,
+    headers: buildSpotifyWebHeaders(),
+    validateStatus: () => true,
+  });
+  const finalUrl = String(response?.request?.res?.responseUrl || response?.headers?.location || "").trim();
+  return extractTrackIdFromValue(finalUrl);
+}
+
+async function fetchSpotifyTrackPayload(trackId, options = {}) {
+  const signal = options?.signal || null;
+  const payload = await spotifyPathfinderQuery(
+    "queryTrack",
+    {
+      uri: buildSpotifyTrackUri(trackId),
+    },
+    SPOTIFY_TRACK_HASH,
+    { signal }
+  );
+
+  const track = payload?.data?.trackUnion;
+  if (!track || track.__typename !== "Track") {
+    throw new Error("No se encontro esa cancion en Spotify.");
+  }
+  return track;
+}
+
+async function fetchSpotifyEmbedPreview(trackId, options = {}) {
+  const signal = options?.signal || null;
+  const response = await axios.get(`${SPOTIFY_WEB_BASE}/embed/track/${trackId}`, {
+    timeout: 15000,
+    signal,
+    headers: buildSpotifyWebHeaders(),
+    validateStatus: () => true,
+  });
+
+  if (response.status >= 400 || !response.data) return "";
+
+  const match = String(response.data).match(/https:\/\/p\.scdn\.co\/mp3-preview\/[A-Za-z0-9]+/i);
+  return match ? String(match[0]).trim() : "";
+}
+
+function normalizeSpotifyTrackInfo(track, trackId) {
+  const resolvedId = extractTrackIdFromValue(track?.uri || trackId || "");
+  const title = cleanText(track?.name || "spotify") || "spotify";
+  const firstArtists = track?.firstArtist?.items || [];
+  const otherArtists = track?.otherArtists?.items || [];
+  const artist = formatArtistNames([...firstArtists, ...otherArtists]);
+  const durationMs = Number(track?.duration?.totalMilliseconds || 0);
+  const previewUrl = String(track?.previews?.audioPreviews?.items?.[0]?.url || "").trim();
+
+  return {
+    trackId: resolvedId,
+    title: safeFileName(title),
+    rawTitle: title,
+    artist,
+    duration: formatDurationFromMs(durationMs),
+    thumbnail: pickBestImageUrl(track?.albumOfTrack?.coverArt?.sources),
+    spotifyUrl: resolvedId ? buildSpotifyTrackUrl(resolvedId) : "",
+    fileName: normalizeMp3Name(`${title} - ${artist}`),
+    previewUrl,
+  };
+}
+
+async function getSpotifyTrackInfo(trackId, options = {}) {
+  const signal = options?.signal || null;
+  const track = await fetchSpotifyTrackPayload(trackId, { signal });
+  const info = normalizeSpotifyTrackInfo(track, trackId);
+  if (!info.previewUrl) {
+    info.previewUrl = await fetchSpotifyEmbedPreview(trackId, { signal });
+  }
+  if (!info.previewUrl) {
+    throw new Error("Spotify no tiene preview de audio disponible para esa cancion.");
+  }
+  return info;
+}
+
+async function searchSpotifyTracks(query, options = {}) {
+  const signal = options?.signal || null;
+  const limit = Math.max(1, Math.min(20, Number(options?.limit || SEARCH_RESULT_LIMIT)));
+  const cleanedQuery = cleanText(query);
+  if (cleanedQuery.length < 2) {
+    throw new Error("Debes enviar una busqueda valida.");
+  }
+
+  const payload = await spotifyPathfinderQuery(
+    "findTracks",
+    {
+      query: cleanedQuery,
+      limit,
+      offset: 0,
+    },
+    SPOTIFY_SEARCH_HASH,
+    { signal }
+  );
+
+  const items = payload?.data?.searchV2?.tracksV2?.items;
+  const results = normalizeSpotifySearchResults(items);
+  if (!results.length) {
+    throw new Error("No encontre resultados en Spotify.");
+  }
+  return results.slice(0, limit);
+}
+
+async function requestSpotifyInfo(input, options = {}) {
+  const signal = options?.signal || null;
+  const pick = Math.max(1, Math.min(20, Number(options?.pick || 1)));
+  const limit = Math.max(1, Math.min(20, Number(options?.limit || SEARCH_RESULT_LIMIT)));
+  const explicitPick = options?.explicitPick === true;
+  const cleanedInput = cleanText(input);
+  let results = [];
+  let trackId = await resolveSpotifyTrackId(cleanedInput, { signal });
+  let selectedFromResultsIndex = 0;
+
+  if (!trackId) {
+    results = await searchSpotifyTracks(cleanedInput, { limit, signal });
+    selectedFromResultsIndex = Math.min(pick, results.length) - 1;
+    const selected = results[selectedFromResultsIndex] || results[0];
+    trackId = selected?.trackId || "";
+  }
+
+  if (!trackId) {
+    throw new Error("No se pudo identificar la cancion de Spotify.");
+  }
+
+  let trackInfo = null;
+  let lastPreviewError = null;
+
+  if (results.length) {
+    const selected = results[selectedFromResultsIndex] || results[0];
+    const fallbackCandidates = explicitPick
+      ? [selected]
+      : [
+          selected,
+          ...results.filter((entry, index) => entry?.trackId && index !== selectedFromResultsIndex),
+        ];
+
+    for (const candidate of fallbackCandidates) {
+      if (!candidate?.trackId) continue;
+      try {
+        trackInfo = await getSpotifyTrackInfo(candidate.trackId, { signal });
+        trackId = candidate.trackId;
+        break;
+      } catch (error) {
+        lastPreviewError = error;
+      }
+    }
+  } else {
+    trackInfo = await getSpotifyTrackInfo(trackId, { signal });
+  }
+
+  if (!trackInfo) {
+    throw lastPreviewError || new Error("No se pudo obtener el preview de Spotify.");
+  }
+
+  if (results.length) {
+    results = results.map((entry) =>
+      entry.trackId === trackInfo.trackId
+        ? {
+            ...entry,
+            duration: trackInfo.duration,
+            thumbnail: trackInfo.thumbnail || entry.thumbnail,
+            fileName: trackInfo.fileName,
+          }
+        : entry
+    );
+  }
+
+  return {
+    ...trackInfo,
+    results,
+    count: results.length || 1,
+    contentType: "spotify_preview",
+  };
 }
 
 function extractApiError(data, status) {
@@ -262,14 +684,6 @@ function parseContentDispositionFileName(headerValue) {
   return "";
 }
 
-function normalizeApiUrl(url) {
-  const value = String(url || "").trim();
-  if (!value) return "";
-  if (/^https?:\/\//i.test(value)) return value;
-  if (value.startsWith("/")) return `${API_BASE}${value}`;
-  return `${API_BASE}/${value}`;
-}
-
 function deleteFileSafe(filePath) {
   try {
     if (filePath && fs.existsSync(filePath)) {
@@ -291,117 +705,6 @@ async function readStreamToText(stream) {
   });
 }
 
-async function apiGet(url, params, timeout = REQUEST_TIMEOUT, options = {}) {
-  const response = await axios.get(url, {
-    timeout,
-    params,
-    signal: options?.signal || undefined,
-    validateStatus: () => true,
-  });
-
-  const data = response.data;
-
-  if (response.status >= 400) {
-    throw new Error(extractApiError(data, response.status));
-  }
-
-  if (data?.ok === false || data?.status === false) {
-    throw new Error(extractApiError(data, response.status));
-  }
-
-  return data;
-}
-
-function normalizeSpotifyResults(results = []) {
-  return (Array.isArray(results) ? results : [])
-    .filter((item) => item && typeof item === "object")
-    .map((item, index) => ({
-      index: index + 1,
-      title: clipText(item.title || "Sin titulo", 72),
-      rawTitle: cleanText(item.title || "spotify") || "spotify",
-      artist: clipText(item.artist || "Spotify", 42),
-      rawArtist: cleanText(item.artist || "Spotify") || "Spotify",
-      duration: cleanText(item.duration || "??:??") || "??:??",
-      thumbnail: String(item.thumbnail || "").trim() || null,
-      spotifyUrl: String(item.spotify_url || item.url || "").trim(),
-      fileName: String(item.filename || "").trim() || null,
-      downloadUrl: normalizeApiUrl(
-        item.download_url_full ||
-          item.stream_url_full ||
-          item.download_url ||
-          item.stream_url ||
-          item.download_path ||
-          item.url
-      ),
-    }))
-    .filter((item) => item.spotifyUrl);
-}
-
-async function requestSpotifyInfo(input, options = {}) {
-  const pick = Math.max(1, Math.min(20, Number(options?.pick || 1)));
-  const limit = Math.max(1, Math.min(20, Number(options?.limit || SEARCH_RESULT_LIMIT)));
-  const data = await apiGet(
-    API_SPOTIFY_URL,
-    buildSpotifyParams(input, {
-      mode: "link",
-      pick,
-      limit,
-      lang: options?.lang || "es3",
-    }),
-    REQUEST_TIMEOUT,
-    options
-  );
-
-  const results = normalizeSpotifyResults(data?.results);
-  const selected = data?.selected && typeof data.selected === "object"
-    ? data.selected
-    : results[pick - 1] || results[0] || {};
-
-  const title = safeFileName(data?.title || selected?.title || "spotify");
-  const artist = cleanText(data?.artist || selected?.artist || "Spotify API") || "Spotify API";
-  const thumbnail = data?.thumbnail || selected?.thumbnail || null;
-  const duration = cleanText(data?.duration || selected?.duration || "");
-  const spotifyUrl = String(data?.spotify_url || selected?.spotify_url || selected?.url || "").trim();
-  const downloadUrl = normalizeApiUrl(
-    data?.download_url_full ||
-      data?.stream_url_full ||
-      data?.download_url ||
-      data?.stream_url ||
-      data?.url ||
-      selected?.download_url_full ||
-      selected?.stream_url_full ||
-      selected?.download_url ||
-      selected?.stream_url ||
-      selected?.download_path
-  );
-  const contentType = cleanText(data?.content_type || "spotify") || "spotify";
-
-  if (contentType === "fallback_youtube") {
-    throw new Error("La API devolvio un fallback de YouTube y este comando solo acepta Spotify real.");
-  }
-
-  if (!spotifyUrl) {
-    throw new Error("La API de Spotify no devolvio una URL real de Spotify.");
-  }
-
-  if (!downloadUrl) {
-    throw new Error("La API de Spotify no devolvio un enlace de descarga.");
-  }
-
-  return {
-    title,
-    rawTitle: cleanText(data?.title || selected?.title || title) || title,
-    artist,
-    duration,
-    thumbnail,
-    spotifyUrl,
-    fileName: normalizeMp3Name(data?.filename || selected?.filename || `${title}.mp3`),
-    downloadUrl,
-    results,
-    count: Math.max(0, Number(data?.count || results.length || 0)),
-    contentType,
-  };
-}
 
 async function downloadThumbnailBuffer(url, signal = null) {
   if (!String(url || "").trim()) return null;
@@ -428,7 +731,7 @@ async function sendSpotifySearchPicker(ctx, query, results, options = {}) {
     header: `${index + 1}`,
     title: clipText(result.title || "Sin titulo", 72),
     description: clipText(
-      `MP3 | ${result.duration || "??:??"} | ${result.artist || "Spotify"}`,
+      `Preview Spotify | ${result.artist || "Spotify"}`,
       72
     ),
     id: result.spotifyUrl
@@ -472,12 +775,12 @@ async function sendSpotifySearchPicker(ctx, query, results, options = {}) {
     text: `Resultados para: ${clipText(query, 80)}`,
     title: "FSOCIETY BOT",
     subtitle: "Selecciona tu cancion",
-    footer: "Spotify audio",
+    footer: "Spotify preview",
     interactiveButtons: [
       {
         name: "single_select",
         buttonParamsJson: JSON.stringify({
-          title: "Descargar audio",
+          title: "Descargar preview",
           sections: [
             {
               title: "Resultados",
@@ -513,7 +816,7 @@ async function sendSpotifySearchPicker(ctx, query, results, options = {}) {
 }
 
 async function downloadSpotifyAudio(
-  downloadUrl,
+  previewUrl,
   outputPath,
   suggestedFileName = "spotify.mp3",
   options = {}
@@ -523,7 +826,7 @@ async function downloadSpotifyAudio(
 
   let response;
   try {
-    response = await axios.get(downloadUrl, {
+    response = await axios.get(previewUrl, {
       responseType: "stream",
       timeout: REQUEST_TIMEOUT,
       signal,
@@ -531,7 +834,7 @@ async function downloadSpotifyAudio(
         "User-Agent":
           "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122 Safari/537.36",
         Accept: "*/*",
-        Referer: `${API_BASE}/`,
+        Referer: `${SPOTIFY_WEB_BASE}/`,
       },
       validateStatus: () => true,
       maxRedirects: 5,
@@ -729,7 +1032,7 @@ async function sendSpotifyAudio(
         document: { url: filePath },
         mimetype: mimetype || "audio/mpeg",
         fileName,
-        caption: `api dvyer\n\n🎵 ${title}\n🎤 ${artistLabel}\n📦 Enviado como documento`,
+        caption: `Spotify Preview\n\n🎵 ${title}\n🎤 ${artistLabel}\n📦 Enviado como documento`,
         ...global.channelInfo,
       },
       quoted
@@ -759,7 +1062,7 @@ async function sendSpotifyAudio(
         document: { url: filePath },
         mimetype: mimetype || "audio/mpeg",
         fileName,
-        caption: `api dvyer\n\n🎵 ${title}\n🎤 ${artistLabel}\n📦 Enviado como documento`,
+        caption: `Spotify Preview\n\n🎵 ${title}\n🎤 ${artistLabel}\n📦 Enviado como documento`,
         ...global.channelInfo,
       },
       quoted
@@ -771,7 +1074,7 @@ async function sendSpotifyAudio(
 export default {
   command: ["spotify", "spoti"],
   category: "descarga",
-  description: "Busca o descarga audio usando solo la API /spotify",
+  description: "Busca en Spotify y descarga preview oficial sin YouTube",
 
   run: async (ctx) => {
     const { sock, from, settings } = ctx;
@@ -826,6 +1129,19 @@ export default {
         );
       }
 
+      const spotifyEntityType = extractSpotifyEntityType(userInput);
+      if (spotifyEntityType && spotifyEntityType !== "track") {
+        cooldowns.delete(userId);
+        return sock.sendMessage(
+          from,
+          {
+            text: "Por ahora solo se admite enlace de *track* de Spotify o una busqueda por texto.",
+            ...global.channelInfo,
+          },
+          quoted
+        );
+      }
+
       if (isHttpUrl(userInput) && !isSpotifyUrl(userInput)) {
         cooldowns.delete(userId);
         return sock.sendMessage(
@@ -840,6 +1156,7 @@ export default {
 
       const info = await requestSpotifyInfo(userInput, {
         pick: parsedInput.pick,
+        explicitPick: parsedInput.explicitPick,
         limit: SEARCH_RESULT_LIMIT,
         signal: abortSignal,
       });
@@ -866,7 +1183,7 @@ export default {
         return;
       }
 
-      const sourceLabel = "Spotify API";
+      const sourceLabel = "Spotify";
 
       await sock.sendMessage(
         from,
@@ -874,17 +1191,19 @@ export default {
           ? {
               image: { url: info.thumbnail },
               caption:
-                `🎵 Preparando audio...\n\n` +
+                `🎵 Preparando preview...\n\n` +
                 `🎧 ${info.rawTitle}\n` +
                 `🎤 ${info.artist}\n` +
+                `⏱ ${info.duration || "30s"}\n` +
                 `🌐 ${sourceLabel}`,
               ...global.channelInfo,
             }
           : {
               text:
-                `🎵 Preparando audio...\n\n` +
+                `🎵 Preparando preview...\n\n` +
                 `🎧 ${info.rawTitle}\n` +
                 `🎤 ${info.artist}\n` +
+                `⏱ ${info.duration || "30s"}\n` +
                 `🌐 ${sourceLabel}`,
               ...global.channelInfo,
             },
@@ -896,11 +1215,11 @@ export default {
       finalMp3Path = path.join(TMP_DIR, `${stamp}-spotify-final.mp3`);
 
       const downloaded = await downloadSpotifyAudio(
-        info.downloadUrl,
+        info.previewUrl,
         rawAudioPath,
         info.fileName,
         {
-        signal: abortSignal,
+          signal: abortSignal,
         }
       );
 
