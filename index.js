@@ -1724,6 +1724,10 @@ const MANAGED_STOP_LOG_THROTTLE_MS = Math.max(
   2_000,
   parseNumberEnv("MANAGED_STOP_LOG_THROTTLE_MS", 12_000) || 12_000
 );
+const SUBBOT_RESERVATION_TIMEOUT_MS = Math.max(
+  30_000,
+  parseNumberEnv("SUBBOT_RESERVATION_TIMEOUT_MS", 60_000) || 60_000
+);
 const GROUP_METADATA_CACHE_TTL_MS = Math.max(
   60_000,
   parseNumberEnv("GROUP_METADATA_CACHE_TTL_MS", 5 * 60 * 1000) || 5 * 60 * 1000
@@ -4938,6 +4942,82 @@ function shouldKeepSplitSubbotProcess(config = {}) {
   return Boolean(hasPersistedBotSession(config) || hasPendingSubbotAssignment(config));
 }
 
+function shouldRunSubbotReservationCleanup() {
+  return !SPLIT_PROCESS_MODE || PROCESS_BOT_ID === "main";
+}
+
+function isSubbotReservationExpired(summary = {}) {
+  const requestedAt = normalizeTimestamp(summary?.requestedAt);
+  if (!requestedAt) {
+    return false;
+  }
+
+  if (summary?.connected || summary?.registered || summary?.pairingPending) {
+    return false;
+  }
+
+  if (!getSubbotAssignedNumber(summary)) {
+    return false;
+  }
+
+  return Date.now() - requestedAt >= SUBBOT_RESERVATION_TIMEOUT_MS;
+}
+
+function runSubbotReservationCleanup() {
+  if (!shouldRunSubbotReservationCleanup()) {
+    return 0;
+  }
+
+  let releasedCount = 0;
+
+  for (const config of SUBBOT_SLOT_CONFIGS) {
+    if (!config || config.enabled === false) {
+      continue;
+    }
+
+    const summary = summarizeBotConfig(config);
+    if (!isSubbotReservationExpired(summary)) {
+      continue;
+    }
+
+    const botState = botStates.get(config.id) || null;
+    if (botState && (!SPLIT_PROCESS_MODE || PROCESS_BOT_ID === "main")) {
+      const released = releaseSubbotSlot(botState, {
+        reason: "reserva_expirada",
+        closeSocket: true,
+        resetAuthFolder: true,
+      });
+      if (released) {
+        releasedCount += 1;
+      }
+      continue;
+    }
+
+    const releasedConfig = saveSubbotSlotConfig(config.slot, {
+      enabled: false,
+      pairingNumber: "",
+      requesterNumber: "",
+      requesterJid: "",
+      requestedAt: 0,
+      releasedAt: Date.now(),
+    });
+
+    if (releasedConfig) {
+      clearPersistedBotRuntimeState(config.id);
+      releasedCount += 1;
+    }
+  }
+
+  if (releasedCount > 0) {
+    console.log(
+      `[SUBBOT] Libere ${releasedCount} slot(s) por reserva expirada ` +
+        `(${Math.floor(SUBBOT_RESERVATION_TIMEOUT_MS / 1000)}s).`
+    );
+  }
+
+  return releasedCount;
+}
+
 async function listPm2ProcessNames() {
   const result = await runPm2Command(["jlist"]);
   if (!result.ok) {
@@ -5381,6 +5461,7 @@ function syncSettingsFromDisk() {
 
 async function syncManagedProcessBots() {
   syncSettingsFromDisk();
+  runSubbotReservationCleanup();
 
   for (const config of getManagedProcessBotConfigs()) {
     try {
