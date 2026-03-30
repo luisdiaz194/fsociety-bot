@@ -41,6 +41,12 @@ function normalizeRegion(value = "") {
   return region || "N/D";
 }
 
+function compactUrl(value = "", max = 95) {
+  const text = String(value || "").trim();
+  if (text.length <= max) return text;
+  return `${text.slice(0, Math.max(1, max - 3))}...`;
+}
+
 function buildTikTokPublicUrl(item = {}) {
   const explicitUrl = String(item?.publicUrl || item?.url || "").trim();
   if (/^https?:\/\/(?:www\.)?(?:m\.)?tiktok\.com\//i.test(explicitUrl)) {
@@ -88,20 +94,36 @@ function buildSections(results, prefix) {
 }
 
 function buildCardButtons(item, prefix) {
-  const copyCode = buildTikTokCommandId(prefix, item);
+  return buildCardButtonsWithMode(item, prefix, "copy");
+}
+
+function buildCardButtonsWithMode(item, prefix, mode = "copy") {
+  const commandId = buildTikTokCommandId(prefix, item);
+
+  if (mode === "quick_reply") {
+    return [
+      {
+        name: "quick_reply",
+        buttonParamsJson: JSON.stringify({
+          display_text: "Descargar",
+          id: commandId,
+        }),
+      },
+    ];
+  }
 
   return [
     {
       name: "cta_copy",
       buttonParamsJson: JSON.stringify({
         display_text: "Copy",
-        copy_code: copyCode,
+        copy_code: commandId,
       }),
     },
   ];
 }
 
-function buildDetailedCardBody(item, index, query) {
+function buildDetailedCardBody(item, index, query, mode = "detailed") {
   const title = clipText(item?.title || "Sin titulo", 220);
   const author = String(item?.author || "usuario").replace(/^@/, "");
   const likes = Number(item?.stats?.likes || 0);
@@ -111,12 +133,37 @@ function buildDetailedCardBody(item, index, query) {
   const duration = formatDurationSeconds(item?.durationSeconds || 0);
   const region = normalizeRegion(item?.region || "");
   const publicUrl = buildTikTokPublicUrl(item) || String(item?.play || "").trim() || "N/D";
+  const safeUrl = compactUrl(publicUrl, 95);
+
+  if (mode === "minimal") {
+    return (
+      `Resultados para: ${clipText(query, 40)}\n` +
+      `➠ Video: ${index + 1}\n` +
+      `➠ Autor: ${author}\n` +
+      `➠ Reproducciones: ${views}\n` +
+      `➠ URL: ${safeUrl}`
+    );
+  }
+
+  if (mode === "compact") {
+    return (
+      `Resultados para: ${clipText(query, 48)}\n` +
+      `TikTok - Resultado\n` +
+      `➠ Video: ${index + 1}\n` +
+      `➠ Titulo: ${clipText(title, 120)}\n` +
+      `➠ Autor: ${author}\n` +
+      `➠ Likes: ${likes} | Comentarios: ${comments}\n` +
+      `➠ Reproducciones: ${views}\n` +
+      `➠ URL: ${safeUrl}\n\n` +
+      `Usa el boton para descargar/ver`
+    );
+  }
 
   return (
     `Resultados para: ${clipText(query, 60)}\n` +
     `TikTok - Resultado\n` +
     `➠ Video: ${index + 1}\n` +
-    `➠ Titulo: ${title}\n` +
+    `➠ Titulo: ${clipText(title, 130)}\n` +
     `➠ Duracion: ${duration}\n` +
     `➠ Region: ${region}\n` +
     `➠ Autor: ${author}\n` +
@@ -124,12 +171,12 @@ function buildDetailedCardBody(item, index, query) {
     `➠ Comentarios: ${comments}\n` +
     `➠ Shares: ${shares}\n` +
     `➠ Reproducciones: ${views}\n` +
-    `➠ URL: ${publicUrl}\n\n` +
+    `➠ URL: ${safeUrl}\n\n` +
     `Usa el boton para descargar/ver`
   );
 }
 
-function buildCarouselCards(results, prefix, query, mode = "video") {
+function buildCarouselCards(results, prefix, query, mode = "video", bodyMode = "detailed", buttonMode = "copy") {
   return results.map((item, index) => {
     const play = String(item?.play || "").trim();
     const cover = String(item?.cover || "").trim() || DEFAULT_CAROUSEL_COVER;
@@ -141,9 +188,9 @@ function buildCarouselCards(results, prefix, query, mode = "video") {
     return {
       ...mediaPayload,
       title: "TikTok - Resultado",
-      body: buildDetailedCardBody(item, index, query),
+      body: buildDetailedCardBody(item, index, query, bodyMode),
       footer: "FSOCIETY BOT",
-      buttons: buildCardButtons(item, prefix),
+      buttons: buildCardButtonsWithMode(item, prefix, buttonMode),
     };
   });
 }
@@ -156,30 +203,44 @@ async function sendCarouselResults(sock, from, quoted, query, results, prefix) {
     ...global.channelInfo,
   };
 
-  try {
-    const videoCards = buildCarouselCards(results, prefix, query, "video");
-    await sock.sendMessage(
-      from,
-      {
-        ...basePayload,
-        cards: videoCards,
-      },
-      quoted
-    );
-    return;
-  } catch (videoError) {
-    console.error("ttsearch video carousel fallback:", videoError?.message || videoError);
+  const attempts = [
+    {
+      label: "video-detailed-copy",
+      cards: buildCarouselCards(results, prefix, query, "video", "detailed", "copy"),
+    },
+    {
+      label: "image-detailed-copy",
+      cards: buildCarouselCards(results, prefix, query, "image", "detailed", "copy"),
+    },
+    {
+      label: "image-compact-copy",
+      cards: buildCarouselCards(results, prefix, query, "image", "compact", "copy"),
+    },
+    {
+      label: "image-minimal-quick",
+      cards: buildCarouselCards(results, prefix, query, "image", "minimal", "quick_reply"),
+    },
+  ];
+
+  let lastError = null;
+  for (const attempt of attempts) {
+    try {
+      await sock.sendMessage(
+        from,
+        {
+          ...basePayload,
+          cards: attempt.cards,
+        },
+        quoted
+      );
+      return;
+    } catch (error) {
+      lastError = error;
+      console.error(`ttsearch carousel fallback (${attempt.label}):`, error?.message || error);
+    }
   }
 
-  const imageCards = buildCarouselCards(results, prefix, query, "image");
-  await sock.sendMessage(
-    from,
-    {
-      ...basePayload,
-      cards: imageCards,
-    },
-    quoted
-  );
+  throw lastError || new Error("No se pudo enviar carrusel TikTok.");
 }
 
 async function sendFallbackResults(sock, from, quoted, query, results, prefix) {
